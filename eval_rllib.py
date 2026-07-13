@@ -118,12 +118,16 @@ def main() -> None:
         checkpoint = find_latest_checkpoint(checkpoint)
 
     algo = load_algorithm(checkpoint)
-    env = TrafficMARLEnv(
+    algo_env_config = dict(getattr(algo.config, "env_config", {}) or {})
+    algo_env_config.update(
         {
             "seed": args.seed,
             "max_steps": args.max_steps,
             "num_agents": args.num_agents,
         }
+    )
+    env = TrafficMARLEnv(
+        algo_env_config
     )
     rollout = record_rollout(env, algo, explore=False)
     print("RLlib residual-policy rollout:")

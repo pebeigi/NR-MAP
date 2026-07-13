@@ -23,10 +23,13 @@ def directional_utility(s_theta: np.ndarray, theta_error_deg: np.ndarray) -> np.
     return s_theta * np.cos(np.deg2rad(theta_error_deg))
 
 
-def speed_utility(s_v: np.ndarray, rho_g: np.ndarray, xi_i: np.ndarray) -> np.ndarray:
-    """Paper Eq. 6."""
-    rho_g = np.maximum(rho_g, 1e-6)
-    return s_v * (rho_g / (1 + rho_g ** ((xi_i - 1) / 2)))
+def speed_utility(s_v: np.ndarray, v_cand: np.ndarray, v_des: np.ndarray, xi_i: np.ndarray) -> np.ndarray:
+    """Symmetric candidate-speed vs desired-speed utility."""
+    v_cand = np.maximum(v_cand, 0.0)
+    v_des = np.maximum(v_des, 1e-6)
+    rho = np.minimum(v_cand, v_des) / np.maximum(v_cand, v_des)
+    rho = np.maximum(rho, 1e-6)
+    return s_v * (rho / (1 + rho ** ((xi_i - 1) / 2)))
 
 
 def proximity_utility(
@@ -121,15 +124,17 @@ def plot_response_surface_slices(
 
 
 def plot_speed_3d(show: bool = False) -> None:
-    s_v = np.linspace(0.2, 1.0, 80)
-    rho_g = np.linspace(0.2, 2.5, 80)
+    v_cand = np.linspace(0.0, 22.0, 80)
+    v_des = np.linspace(2.0, 22.0, 80)
     xi_slices = [1.5, 2.5, 3.5]
     plot_response_surface_slices(
-        s_v,
-        rho_g,
+        v_cand,
+        v_des,
         xi_slices,
-        utility_fn=lambda s_v_grid, rho_grid, xi: speed_utility(s_v_grid, rho_grid, xi),
-        labels=(r"$S_v$", r"$\rho_g$", r"$\xi_i$"),
+        utility_fn=lambda v_cand_grid, v_des_grid, xi: speed_utility(
+            1.0, v_cand_grid, v_des_grid, xi
+        ),
+        labels=(r"$v_{\mathrm{cand}}$", r"$v_{\mathrm{des}}$", r"$\xi_i$"),
         title="Speed Utility Response Surfaces",
         output_path=OUTPUT_DIR / "speed_utility_surface_slices.png",
         cmap="viridis",

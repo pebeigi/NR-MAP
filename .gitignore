@@ -1,0 +1,65 @@
+# Large raw datasets (GitHub 100 MB limit)
+data/Final_Lebanon_Data.csv
+*.csv.gz
+*.h5
+*.hdf5
+*.parquet
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local env / secrets
+.env
+.env.*
+.venv/
+venv/
+ENV/
+
+# Training checkpoints and model weights (large binaries)
+checkpoints/
+*.pt
+*.pth
+*.pkl
+*.pickle
+*.onnx
+*.joblib
+
+# Generated figures / media that are often large
+figures/simulation/*.gif
+figures/sensitivity/3d/
+
+# Calibration run artifacts (regenerated locally; keep utility_calibration.json)
+calibration/diagnostics/
+
+# Ray / RLlib local caches
+ray_results/
+~/ray_results/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +31,14 @@ def checkpoint_path(save_result) -> Path:
 
 def env_creator(env_config: dict | None = None):
     return TrafficMARLEnv(env_config or {})
+
+
+def load_calibrated_base_params(path: Path | None) -> dict[str, float] | None:
+    if path is None:
+        return None
+    payload = json.loads(path.read_text())
+    params = payload.get("best_params", payload)
+    return {key: float(value) for key, value in params.items()}
 
 
 def build_ppo_config(
@@ -104,6 +113,10 @@ def train(args: argparse.Namespace) -> Path:
         "residual_scale": args.residual_scale,
         "seed": args.seed,
     }
+    calibrated_params = load_calibrated_base_params(args.calibration)
+    if calibrated_params is not None:
+        env_config["base_params"] = calibrated_params
+        print(f"Using calibrated base utility parameters from {args.calibration}")
 
     tune.register_env(ENV_NAME, env_creator)
     config = build_ppo_config(
@@ -165,6 +178,12 @@ def main() -> None:
     parser.add_argument("--baseline-episodes", type=int, default=3)
     parser.add_argument("--checkpoint-freq", type=int, default=25)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--calibration",
+        type=Path,
+        default=None,
+        help="Optional calibration JSON with best_params to use as Θ_base",
+    )
     parser.add_argument(
         "--checkpoint-dir",
         type=Path,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 import numpy as np
@@ -88,9 +89,10 @@ DEFAULT_SIM_CONFIG: dict[str, Any] = {
     "road_y_max": 12.0,
     "path_mode": "boundary",
     "wheelbase": 2.8,
-    "candidate_accel_grid": [-3.0, -1.5, 0.0, 1.5, 3.0],
-    "candidate_steering_grid": [-0.35, -0.17, 0.0, 0.17, 0.35],
+    "candidate_accel_grid": [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0],
+    "candidate_steering_grid": [-0.45, -0.3375, -0.225, -0.1125, 0.0, 0.1125, 0.225, 0.3375, 0.45],
     "steering_penalty_weight": 0.5,
+    "utility_frame": "corridor",
 }
 
 
@@ -130,6 +132,102 @@ def apply_residual(
     return clip_params(merged)
 
 
+@dataclass(frozen=True)
+class CorridorGeometry:
+    center: np.ndarray
+    cumulative_s: np.ndarray
+    tangents: np.ndarray
+
+    @classmethod
+    def from_center(cls, center: np.ndarray) -> "CorridorGeometry | None":
+        center = np.asarray(center, dtype=float)
+        if center.shape[0] < 2:
+            return None
+        seg = center[1:] - center[:-1]
+        seg_lens = np.linalg.norm(seg, axis=1)
+        cumulative_s = np.concatenate([[0.0], np.cumsum(seg_lens)])
+        tangents = seg / np.maximum(seg_lens[:, None], 1e-12)
+        return cls(center=center, cumulative_s=cumulative_s, tangents=tangents)
+
+    def project(self, point: np.ndarray) -> tuple[float, float, np.ndarray]:
+        point = np.asarray(point, dtype=float)
+        best_dist = float("inf")
+        best_s = 0.0
+        best_lateral = 0.0
+        best_tangent = np.array([1.0, 0.0], dtype=float)
+        for i in range(len(self.center) - 1):
+            a = self.center[i]
+            b = self.center[i + 1]
+            ab = b - a
+            denom = float(ab @ ab) + 1e-12
+            t = float(np.clip(((point - a) @ ab) / denom, 0.0, 1.0))
+            q = a + t * ab
+            dist = float(np.linalg.norm(point - q))
+            if dist < best_dist:
+                tangent = self.tangents[i]
+                normal = np.array([-tangent[1], tangent[0]], dtype=float)
+                best_dist = dist
+                best_s = float(self.cumulative_s[i] + t * np.linalg.norm(ab))
+                best_lateral = float((point - q) @ normal)
+                best_tangent = tangent
+        return best_s, best_lateral, best_tangent
+
+
+@lru_cache(maxsize=32)
+def corridor_geometry_for_run_lane(run_id: int, lane_kf: int) -> CorridorGeometry | None:
+    try:
+        from data.highway_geometry import center_polyline, load_highway_boundaries
+
+        load_highway_boundaries()
+        center = center_polyline(run_id, lane_kf)
+    except Exception:
+        center = None
+    if center is None:
+        return None
+    return CorridorGeometry.from_center(center)
+
+
+def corridor_directional_alignment_utility(
+    current_pos: np.ndarray,
+    candidate_pos: np.ndarray,
+    tangent_at_ego: np.ndarray,
+    params: dict[str, float],
+) -> float:
+    """Reward moving along the local corridor tangent."""
+    move = np.asarray(candidate_pos, dtype=float) - np.asarray(current_pos, dtype=float)
+    move_norm = float(np.linalg.norm(move))
+    if move_norm < 1e-6:
+        return params["S_theta"]
+    move_dir = move / move_norm
+    tangent = np.asarray(tangent_at_ego, dtype=float)
+    tangent_norm = float(np.linalg.norm(tangent))
+    if tangent_norm < 1e-6:
+        return 0.0
+    tangent = tangent / tangent_norm
+    return params["S_theta"] * float(np.dot(move_dir, tangent))
+
+
+def corridor_distance_reward_utility(
+    candidate_s: float,
+    candidate_lateral: float,
+    reference_s: float,
+    reference_lateral: float,
+    current_speed: float,
+    params: dict[str, float],
+    sim_config: dict[str, Any],
+) -> float:
+    """Reward Frenet coordinates close to a local reference point on the corridor."""
+    d_long = abs(candidate_s - reference_s)
+    d_lat = abs(candidate_lateral - reference_lateral)
+    d_eff = params["w_x"] * d_long + params["w_y"] * d_lat
+    h_p = sim_config["kappa_perception_horizon"] * current_speed
+    h_p = max(h_p, sim_config["min_perception_horizon"])
+    if h_p < 1e-6:
+        return 0.0
+    ratio = d_eff / h_p
+    return params["S_d"] / (1 + ratio ** params["gamma"])
+
+
 def directional_alignment_utility(
     current_pos: np.ndarray,
     candidate_pos: np.ndarray,
@@ -159,28 +257,24 @@ def directional_alignment_utility(
 
 
 def speed_alignment_utility(
-    current_speed: float,
     candidate_speed: float,
     leading_agent_speed: float | None,
     desired_speed: float,
     params: dict[str, float],
     perception_horizon_empty: bool,
 ) -> float:
-    """Paper Eq. 6 with rho_g = v_ref / v_current."""
+    """Reward candidate rollout speed close to desired speed (symmetric ratio form)."""
     if perception_horizon_empty:
-        v_ref_g = desired_speed
+        v_ref = desired_speed
     else:
-        v_ref_g = leading_agent_speed if leading_agent_speed is not None else desired_speed
+        v_ref = leading_agent_speed if leading_agent_speed is not None else desired_speed
 
-    v_current = max(current_speed, 1e-6)
-    if abs(v_ref_g) < 1e-6:
-        rho_g = 1.0
-    else:
-        rho_g = v_ref_g / v_current
-
-    rho_g = max(rho_g, 1e-6)
+    v_cand = max(candidate_speed, 0.0)
+    v_ref = max(v_ref, 1e-6)
+    rho = min(v_cand, v_ref) / max(v_cand, v_ref)
+    rho = max(rho, 1e-6)
     exponent = (params["xi_i"] - 1) / 2
-    return params["S_v"] * (rho_g / (1 + rho_g**exponent))
+    return params["S_v"] * (rho / (1 + rho**exponent))
 
 
 def distance_reward_utility(
@@ -260,6 +354,9 @@ class TrafficAgent:
     dest: np.ndarray
     desired_speed: float
     nominal_y: float
+    run_id: int | None = None
+    lane_kf: int | None = None
+    utility_reference_pos: np.ndarray | None = None
     heading_angle: float | None = None
     current_heading_vector: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.0]))
     reached_destination: bool = False
@@ -378,8 +475,11 @@ def generate_candidate_actions(
     sim_config: dict[str, Any],
 ) -> list[dict[str, Any]]:
     """Discrete acceleration/steering candidates via kinematic bicycle rollout."""
-    accel_grid = sim_config.get("candidate_accel_grid", [-3.0, -1.5, 0.0, 1.5, 3.0])
-    steering_grid = sim_config.get("candidate_steering_grid", [-0.35, -0.17, 0.0, 0.17, 0.35])
+    accel_grid = sim_config.get("candidate_accel_grid", [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0])
+    steering_grid = sim_config.get(
+        "candidate_steering_grid",
+        [-0.45, -0.3375, -0.225, -0.1125, 0.0, 0.1125, 0.225, 0.3375, 0.45],
+    )
 
     current_pos = agent.pos
     current_heading = float(agent.heading_angle)
@@ -432,18 +532,35 @@ def evaluate_candidate_utility(
     cand_speed = float(candidate.get("speed", np.linalg.norm(cand_vel)))
     time_to_reach = candidate["time_to_reach"]
 
-    util_dir = directional_alignment_utility(
-        agent.pos, cand_pos, agent.dest, agent.current_heading_vector, params
-    )
+    use_corridor = sim_config.get("utility_frame", "destination") == "corridor"
+    corridor_geom = None
+    if use_corridor and agent.run_id is not None and agent.lane_kf is not None:
+        corridor_geom = corridor_geometry_for_run_lane(int(agent.run_id), int(agent.lane_kf))
+
+    if corridor_geom is not None:
+        _, _, tangent_at_ego = corridor_geom.project(agent.pos)
+        util_dir = corridor_directional_alignment_utility(agent.pos, cand_pos, tangent_at_ego, params)
+        reference_pos = agent.utility_reference_pos
+        if reference_pos is None:
+            reference_pos = agent.dest
+        ref_s, ref_n, _ = corridor_geom.project(reference_pos)
+        cand_s, cand_n, _ = corridor_geom.project(cand_pos)
+        util_dist = corridor_distance_reward_utility(
+            cand_s, cand_n, ref_s, ref_n, agent.speed, params, sim_config
+        )
+    else:
+        util_dir = directional_alignment_utility(
+            agent.pos, cand_pos, agent.dest, agent.current_heading_vector, params
+        )
+        util_dist = distance_reward_utility(cand_pos, agent.dest, agent.speed, params, sim_config)
+
     util_speed = speed_alignment_utility(
-        agent.speed,
         cand_speed,
         None,
         agent.desired_speed,
         params,
         perception_horizon_empty=True,
     )
-    util_dist = distance_reward_utility(cand_pos, agent.dest, agent.speed, params, sim_config)
     penalty_coll = collision_penalty(agent_idx, cand_pos, agents, params, sim_config, time_to_reach)
     penalty_path = path_adherence_penalty(cand_pos, agent.nominal_y, params, sim_config)
 

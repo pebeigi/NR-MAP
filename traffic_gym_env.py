@@ -64,6 +64,7 @@ class TrafficMARLEnv(MultiAgentEnv):
             spawn_x_range=tuple(env_config.get("spawn_x_range", (0.0, 120.0))),
             target_x_range=tuple(env_config.get("target_x_range", (380.0, 500.0))),
             min_initial_spacing=float(env_config.get("min_initial_spacing", 4.0)),
+            base_params=env_config.get("base_params"),
         )
         self._env = MultiAgentTrafficEnv(self._cfg, seed=env_config.get("seed"))
         self._agent_ids = {agent_id(i) for i in range(self._cfg.num_agents)}

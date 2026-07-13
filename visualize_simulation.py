@@ -341,8 +341,12 @@ def main() -> None:
         algo = load_algorithm(ckpt)
         from traffic_gym_env import TrafficMARLEnv
 
-        rllib_env = TrafficMARLEnv(
+        rllib_env_config = dict(getattr(algo.config, "env_config", {}) or {})
+        rllib_env_config.update(
             {"seed": args.seed, "max_steps": args.max_steps, "num_agents": args.num_agents}
+        )
+        rllib_env = TrafficMARLEnv(
+            rllib_env_config
         )
         residual = record_rllib(rllib_env, algo, explore=False)
     else:

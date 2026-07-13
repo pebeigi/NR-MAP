@@ -55,9 +55,20 @@ class EnvConfig:
                     "max_agent_speed": 16.0,
                     "collision_threshold": 1.5,
                     "wheelbase": 2.8,
-                    "candidate_accel_grid": [-3.0, -1.5, 0.0, 1.5, 3.0],
-                    "candidate_steering_grid": [-0.35, -0.17, 0.0, 0.17, 0.35],
+                    "candidate_accel_grid": [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0],
+                    "candidate_steering_grid": [
+                        -0.45,
+                        -0.3375,
+                        -0.225,
+                        -0.1125,
+                        0.0,
+                        0.1125,
+                        0.225,
+                        0.3375,
+                        0.45,
+                    ],
                     "steering_penalty_weight": 0.5,
+                    "utility_frame": "corridor",
                 }
             )
         if self.base_params is None:
