@@ -1,6 +1,12 @@
 #!/usr/bin/env python
 """Surface-based sensitivity visualizations for utility components.
 
+Aligned with the current NR-MAP utility formulation:
+  - Direction: corridor tangent alignment
+  - Speed: candidate speed vs desired speed (symmetric rho)
+  - Proximity: Frenet / effective distance vs horizon
+  - Collision / path: unchanged shapes
+
 With three varied parameters plus a utility value, a single ordinary 3D surface
 is not possible because that would require four dimensions. The response-surface
 standard is to plot two parameters on x/y, utility on z, and show the third
@@ -18,9 +24,9 @@ import numpy as np
 OUTPUT_DIR = Path("figures/sensitivity/3d")
 
 
-def directional_utility(s_theta: np.ndarray, theta_error_deg: np.ndarray) -> np.ndarray:
-    """Paper Eq. 5: U_dir = S_theta * cos(theta - theta_goal)."""
-    return s_theta * np.cos(np.deg2rad(theta_error_deg))
+def directional_utility(s_theta: np.ndarray, alignment_cos: np.ndarray) -> np.ndarray:
+    """Corridor-frame direction utility: U_dir = S_theta * (m_hat · t_hat)."""
+    return s_theta * alignment_cos
 
 
 def speed_utility(s_v: np.ndarray, v_cand: np.ndarray, v_des: np.ndarray, xi_i: np.ndarray) -> np.ndarray:
@@ -38,13 +44,13 @@ def proximity_utility(
     d_eff: np.ndarray,
     h_p: np.ndarray,
 ) -> np.ndarray:
-    """Paper Eq. 7."""
+    """Proximity / progress utility over effective Frenet distance."""
     h_p = np.maximum(h_p, 1e-6)
     return s_d / (1 + (d_eff / h_p) ** gamma)
 
 
 def collision_utility(w_c: np.ndarray, d: np.ndarray, sigma: np.ndarray) -> np.ndarray:
-    """Paper Eqs. 10-12 for a single neighbor with isotropic 2D covariance."""
+    """Collision penalty contribution for a single isotropic 2D neighbor prediction."""
     sigma = np.maximum(sigma, 1e-6)
     prob_coll = (1.0 / (2 * np.pi * sigma**2)) * np.exp(-0.5 * (d / sigma) ** 2)
     return -w_c * prob_coll
@@ -55,7 +61,7 @@ def path_adherence_utility(
     beta: np.ndarray,
     ell_i: np.ndarray,
 ) -> np.ndarray:
-    """Paper Eq. 13 as a negative utility penalty."""
+    """Path / boundary adherence as a negative utility penalty."""
     return -w_ell * (1 - np.exp(-beta * ell_i**2))
 
 
@@ -77,14 +83,15 @@ def plot_response_surface_slices(
     utilities = [utility_fn(x_grid, y_grid, slice_value) for slice_value in slice_values]
     vmin = min(float(np.nanmin(utility)) for utility in utilities)
     vmax = max(float(np.nanmax(utility)) for utility in utilities)
+    if abs(vmax - vmin) < 1e-12:
+        vmax = vmin + 1e-6
 
-    fig = plt.figure(figsize=(18, 5.8))
-    mappable = plt.cm.ScalarMappable(cmap=cmap)
-    mappable.set_clim(vmin, vmax)
+    n_panels = len(slice_values)
+    fig = plt.figure(figsize=(5.8 * n_panels + 1.2, 5.8))
 
     for index, (slice_value, utility_grid) in enumerate(zip(slice_values, utilities), start=1):
-        ax = fig.add_subplot(1, len(slice_values), index, projection="3d")
-        surface = ax.plot_surface(
+        ax = fig.add_subplot(1, n_panels, index, projection="3d")
+        ax.plot_surface(
             x_grid,
             y_grid,
             utility_grid,
@@ -105,22 +112,47 @@ def plot_response_surface_slices(
             levels=10,
             linewidths=0.7,
         )
-        ax.set_title(f"{labels[2]} = {slice_value:g}", fontsize=12)
+        if labels[2] and labels[2] != "(n/a)":
+            ax.set_title(f"{labels[2]} = {slice_value:g}", fontsize=12)
+        else:
+            ax.set_title("Directional utility", fontsize=12)
         ax.set_xlabel(labels[0])
         ax.set_ylabel(labels[1])
         ax.set_zlabel("Utility")
         ax.set_zlim(vmin, vmax)
         ax.view_init(elev=28, azim=-135)
-        mappable = surface
+
+    # Dedicated right strip for the colorbar so it never overlays the panels.
+    fig.subplots_adjust(left=0.04, right=0.86, bottom=0.08, top=0.86, wspace=0.18)
+    cax = fig.add_axes([0.90, 0.18, 0.018, 0.58])
+    mappable = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    mappable.set_array([])
+    colorbar = fig.colorbar(mappable, cax=cax)
+    colorbar.set_label("Utility value")
 
     fig.suptitle(title, fontsize=16)
-    colorbar = fig.colorbar(mappable, ax=fig.axes, shrink=0.72, pad=0.04)
-    colorbar.set_label("Utility value")
-    fig.subplots_adjust(left=0.03, right=0.9, bottom=0.08, top=0.86, wspace=0.12)
-    fig.savefig(output_path, dpi=300)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
     if show:
         plt.show()
     plt.close(fig)
+
+
+def plot_directional_3d(show: bool = False) -> None:
+    s_theta = np.linspace(0.2, 2.0, 80)
+    alignment = np.linspace(-1.0, 1.0, 80)
+    # Constant slices keep a consistent panel format with the other plots.
+    dummy_slices = [0.0]
+    plot_response_surface_slices(
+        s_theta,
+        alignment,
+        dummy_slices,
+        utility_fn=lambda s_grid, cos_grid, _unused: directional_utility(s_grid, cos_grid),
+        labels=(r"$S_\theta$", r"$\hat{m}\cdot\hat{t}$", r"(n/a)"),
+        title="Directional Utility Response Surfaces (Corridor Tangent Alignment)",
+        output_path=OUTPUT_DIR / "directional_utility_surface_slices.png",
+        cmap="viridis",
+        show=show,
+    )
 
 
 def plot_speed_3d(show: bool = False) -> None:
@@ -135,7 +167,7 @@ def plot_speed_3d(show: bool = False) -> None:
             1.0, v_cand_grid, v_des_grid, xi
         ),
         labels=(r"$v_{\mathrm{cand}}$", r"$v_{\mathrm{des}}$", r"$\xi_i$"),
-        title="Speed Utility Response Surfaces",
+        title="Speed Utility Response Surfaces (Candidate vs Desired)",
         output_path=OUTPUT_DIR / "speed_utility_surface_slices.png",
         cmap="viridis",
         show=show,
@@ -156,8 +188,8 @@ def plot_proximity_3d(show: bool = False) -> None:
             d_grid,
             h_p,
         ),
-        labels=(r"$\gamma$", r"$d_{\mathrm{eff}}$", r"$H_p$"),
-        title="Proximity Utility Response Surfaces",
+        labels=(r"$\gamma$", r"$d_{\mathrm{eff}}=w_x|\Delta s|+w_y|\Delta n|$", r"$H_p$"),
+        title="Proximity Utility Response Surfaces (Frenet Effective Distance)",
         output_path=OUTPUT_DIR / "proximity_utility_surface_slices.png",
         cmap="plasma",
         show=show,
@@ -204,6 +236,7 @@ def plot_path_3d(show: bool = False) -> None:
 
 
 def main(show: bool = False) -> None:
+    plot_directional_3d(show=show)
     plot_speed_3d(show=show)
     plot_proximity_3d(show=show)
     plot_collision_3d(show=show)

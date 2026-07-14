@@ -10,79 +10,95 @@ import math
 # --- Utility Function Components (from your Methodology) ---
 # These functions will use the 'params' dictionary, which holds the GSA parameter set.
 
+def _unit(vec):
+    arr = np.asarray(vec, dtype=float)
+    n = float(np.linalg.norm(arr))
+    if n < 1e-9:
+        return None
+    return arr / n
+
+
+def corridor_tangent_for_agent(agent):
+    """Local corridor tangent estimate for sensitivity runs without map polylines."""
+    dest_dir = _unit(np.asarray(agent.dest, dtype=float) - np.asarray(agent.pos, dtype=float))
+    if dest_dir is not None:
+        return dest_dir
+    heading = _unit(agent.current_heading_vector)
+    if heading is not None:
+        return heading
+    return np.array([1.0, 0.0], dtype=float)
+
+
 def directional_alignment_utility(current_pos, candidate_pos, destination_pos, current_heading_vector, params):
     """
-    Directional utility (paper Eq. 5): U_dir = S_theta * cos(theta - theta_goal).
-    cos(theta - theta_goal) is the alignment between the candidate heading and the
-    direction from the candidate position toward the destination.
+    Corridor-frame directional utility:
+    U_dir = S_theta * (move_direction · corridor_tangent).
+    Destination is only used to approximate the local corridor tangent when map geometry
+    is unavailable in this sensitivity script.
     """
-    vec_to_candidate = np.array(candidate_pos) - np.array(current_pos)
-    dist_to_candidate = np.linalg.norm(vec_to_candidate)
-    if dist_to_candidate < 1e-6: # Not moving: align current heading with direction to destination
-        vec_current_to_dest = np.array(destination_pos) - np.array(current_pos)
-        if np.linalg.norm(vec_current_to_dest) < 1e-6: # Already at destination
-            return params['S_theta']
+    move = np.asarray(candidate_pos, dtype=float) - np.asarray(current_pos, dtype=float)
+    move_dir = _unit(move)
+    if move_dir is None:
+        return params["S_theta"]
 
-        dir_to_dest_from_current = vec_current_to_dest / np.linalg.norm(vec_current_to_dest)
-        cos_theta = np.dot(current_heading_vector, dir_to_dest_from_current)
-        return params['S_theta'] * cos_theta
-
-    new_heading_vector = vec_to_candidate / dist_to_candidate
-
-    # Vector from the candidate position to the final destination
-    vec_candidate_to_dest = np.array(destination_pos) - np.array(candidate_pos)
-    dist_candidate_to_dest = np.linalg.norm(vec_candidate_to_dest)
-
-    if dist_candidate_to_dest < 1e-6: # Candidate is destination
-        return params['S_theta']
-
-    dir_to_dest_from_candidate = vec_candidate_to_dest / dist_candidate_to_dest
-
-    # cos(theta - theta_goal): plain cosine, kept signed as in the paper (Eq. 5).
-    cos_theta = np.dot(new_heading_vector, dir_to_dest_from_candidate)
-    return params['S_theta'] * cos_theta
+    tangent = _unit(np.asarray(destination_pos, dtype=float) - np.asarray(current_pos, dtype=float))
+    if tangent is None:
+        tangent = _unit(current_heading_vector)
+    if tangent is None:
+        return 0.0
+    return params["S_theta"] * float(np.dot(move_dir, tangent))
 
 
-def speed_alignment_utility(current_speed_val, candidate_speed_val, leading_agent_speed, desired_speed, params, perception_horizon_empty):
-    """Calculates speed alignment utility."""
+def speed_alignment_utility(
+    current_speed_val,
+    candidate_speed_val,
+    leading_agent_speed,
+    desired_speed,
+    params,
+    perception_horizon_empty,
+):
+    """
+    Speed utility: reward candidate rollout speed close to desired speed.
+    Symmetric ratio form used by utility_model.py.
+    """
     if perception_horizon_empty:
-        v_ref_g = desired_speed
+        v_ref = desired_speed
     else:
-        v_ref_g = leading_agent_speed if leading_agent_speed is not None else desired_speed
+        v_ref = leading_agent_speed if leading_agent_speed is not None else desired_speed
 
-    # v_i_current here refers to the speed the agent *would have* if it takes the action leading to candidate_speed_val
-    # For simplicity in this conceptual model, we can use candidate_speed_val directly as the speed post-action.
-    # If the action implies a change from current_speed_val to candidate_speed_val,
-    # the utility should reflect the desirability of candidate_speed_val.
-    v_agent_at_candidate = candidate_speed_val
+    v_cand = max(float(candidate_speed_val), 0.0)
+    v_ref = max(float(v_ref), 1e-6)
+    rho = min(v_cand, v_ref) / max(v_cand, v_ref)
+    rho = max(rho, 1e-6)
+    exponent = (params["xi_i"] - 1) / 2
+    return params["S_v"] * (rho / (1 + rho**exponent))
 
-    if abs(v_agent_at_candidate) < 1e-6: 
-        if abs(v_ref_g) < 1e-6: rho_g = 1.0 
-        else: rho_g = 1000.0 
-    else:
-        rho_g = v_ref_g / v_agent_at_candidate
-    
-    rho_g = max(1e-6, rho_g) 
 
-    exponent = (params['xi_i'] - 1) / 2
-    utility = params['S_v'] * (rho_g / (1 + rho_g**exponent))
-    return utility
+def distance_reward_utility(candidate_pos, destination_pos, current_speed_val, params, sim_config, current_pos=None):
+    """
+    Proximity utility in a local Frenet frame estimated from ego→destination.
+    d_eff = w_x |Δs| + w_y |Δn|, with reference at the destination projection.
+    """
+    ego = np.asarray(current_pos if current_pos is not None else [0.0, 0.0], dtype=float)
+    cand = np.asarray(candidate_pos, dtype=float)
+    dest = np.asarray(destination_pos, dtype=float)
 
-def distance_reward_utility(candidate_pos, destination_pos, current_speed_val, params, sim_config):
-    """Calculates distance reward utility."""
-    diff = np.abs(np.array(candidate_pos) - np.array(destination_pos))
-    d_eff = params['w_x'] * diff[0] + params['w_y'] * diff[1]
+    tangent = _unit(dest - ego)
+    if tangent is None:
+        tangent = np.array([1.0, 0.0], dtype=float)
+    normal = np.array([-tangent[1], tangent[0]], dtype=float)
 
-    H_p = sim_config['kappa_perception_horizon'] * current_speed_val
-    H_p = max(H_p, sim_config['min_perception_horizon']) 
+    cand_s = float((cand - ego) @ tangent)
+    cand_n = float((cand - ego) @ normal)
+    ref_s = float((dest - ego) @ tangent)
+    ref_n = float((dest - ego) @ normal)
 
-    if H_p < 1e-6: 
-        return 0 
-
-    ratio_d_eff_H_p = d_eff / H_p
-    
-    utility = params['S_d'] / (1 + ratio_d_eff_H_p**params['gamma'])
-    return utility
+    d_eff = params["w_x"] * abs(cand_s - ref_s) + params["w_y"] * abs(cand_n - ref_n)
+    h_p = sim_config["kappa_perception_horizon"] * current_speed_val
+    h_p = max(h_p, sim_config["min_perception_horizon"])
+    if h_p < 1e-6:
+        return 0.0
+    return params["S_d"] / (1 + (d_eff / h_p) ** params["gamma"])
 
 def collision_penalty(agent_i_idx, candidate_pos_agent_i, agents, params, sim_config, time_to_reach_candidate):
     """
@@ -323,16 +339,28 @@ def evaluate_simulation_model(parameter_set_list):
                 cand_speed_val = np.linalg.norm(cand_vel_vec)
                 time_to_reach = action['time_to_reach'] 
 
-                util_dir = directional_alignment_utility(agent.pos, cand_pos, agent.dest, agent.current_heading_vector, params)
-                
-                # Simplified perception for speed alignment:
-                # For this conceptual model, assume no specific leading agent is identified.
-                # v_i_current for speed utility should be the speed resulting from the candidate action.
-                is_horizon_empty_simple = True 
-                leading_speed_simple = None 
-                util_speed = speed_alignment_utility(agent.current_speed, cand_speed_val, leading_speed_simple, agent.desired_speed, params, is_horizon_empty_simple)
+                util_dir = directional_alignment_utility(
+                    agent.pos, cand_pos, agent.dest, agent.current_heading_vector, params
+                )
 
-                util_dist = distance_reward_utility(cand_pos, agent.dest, agent.current_speed, params, sim_config)
+                # Desired-speed alignment on the candidate rollout speed (current formulation).
+                util_speed = speed_alignment_utility(
+                    agent.current_speed,
+                    cand_speed_val,
+                    None,
+                    agent.desired_speed,
+                    params,
+                    perception_horizon_empty=True,
+                )
+
+                util_dist = distance_reward_utility(
+                    cand_pos,
+                    agent.dest,
+                    agent.current_speed,
+                    params,
+                    sim_config,
+                    current_pos=agent.pos,
+                )
 
                 U_pos = util_dir + util_speed + util_dist  # paper Eq. 4: additive components
 

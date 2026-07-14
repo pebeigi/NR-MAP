@@ -226,29 +226,43 @@ for i in range(num_vehicles):
 
 # --- 2. Utility Functions ---
 def calculate_directional_alignment(grid_x, grid_y, ego_vehicle):
-    target_vec = np.array([ego_vehicle['target'][0] - ego_vehicle['position'][0],
-                           ego_vehicle['target'][1] - ego_vehicle['position'][1]])
-    target_vec /= np.linalg.norm(target_vec) + 1e-8
+    # Corridor tangent approximated by local highway forward direction (+x).
+    corridor_tangent = np.array([1.0, 0.0], dtype=float)
     cand_vec = np.array([grid_x - ego_vehicle['position'][0],
-                         grid_y - ego_vehicle['position'][1]])
-    cand_vec /= np.linalg.norm(cand_vec) + 1e-8
-    return S_theta * np.dot(cand_vec, target_vec)
+                         grid_y - ego_vehicle['position'][1]], dtype=float)
+    cand_norm = np.linalg.norm(cand_vec)
+    if cand_norm < 1e-8:
+        return S_theta
+    cand_vec = cand_vec / cand_norm
+    return S_theta * float(np.dot(cand_vec, corridor_tangent))
 
 def calculate_speed_incentive(grid_y, ego_vehicle, all_vehicles):
     if not (HIGHWAY_Y_MIN <= grid_y <= HIGHWAY_Y_MAX):
         return 0.0
-    v_current = np.linalg.norm(ego_vehicle['velocity'])
+    # Approximate candidate speed by current speed (spatial heatmap has no accel rollout).
+    # Prefer lane mean speed as the desired/reference speed for visualization.
+    v_cand = np.linalg.norm(ego_vehicle['velocity'])
     lane_idx = np.argmin([abs(grid_y - center) for center in lanes])
     target_lane_center = lanes[lane_idx]
     vehicles_in_lane = [v for v in all_vehicles if abs(v['position'][1] - target_lane_center) < lane_width / 2]
-    v_ref = np.mean([np.linalg.norm(v['velocity']) for v in vehicles_in_lane]) if vehicles_in_lane else v_desired
-    rho_g = v_ref / max(v_current, 1e-5)
-    return S_v * (rho_g / (1 + abs(rho_g) ** ((xi_i - 1) / 2)))
+    v_des = np.mean([np.linalg.norm(v['velocity']) for v in vehicles_in_lane]) if vehicles_in_lane else v_desired
+    v_cand = max(float(v_cand), 0.0)
+    v_des = max(float(v_des), 1e-6)
+    rho = min(v_cand, v_des) / max(v_cand, v_des)
+    return S_v * (rho / (1 + abs(rho) ** ((xi_i - 1) / 2)))
 
 def calculate_proximity_incentive(grid_x, grid_y, ego_vehicle):
+    # Local Frenet-style effective distance using highway tangent (+x).
     v_i = np.linalg.norm(ego_vehicle['velocity'])
-    H_p = kappa * v_i
-    d_eff = abs(grid_x - ego_vehicle['target'][0]) + abs(grid_y - ego_vehicle['target'][1])
+    H_p = max(kappa * v_i, 1e-6)
+    ego = ego_vehicle['position']
+    cand = np.array([grid_x, grid_y], dtype=float)
+    dest = ego_vehicle['target']
+    tangent = np.array([1.0, 0.0], dtype=float)
+    normal = np.array([0.0, 1.0], dtype=float)
+    d_s = abs(((cand - ego) @ tangent) - ((dest - ego) @ tangent))
+    d_n = abs(((cand - ego) @ normal) - ((dest - ego) @ normal))
+    d_eff = d_s + d_n
     return S_d / (1 + (d_eff / H_p)**gamma)
     
 def calculate_path_adherence(grid_y, all_lane_centers):
@@ -270,35 +284,43 @@ def draw_highway_layout(ax):
 # --- 4. Annotate details ---
 def annotate_directional(ax, ego, hotspot):
     ego_pos = ego['position']
-    target_vec = ego['target'] - ego_pos
-    cand_vec = np.array(hotspot) - ego_pos
-    theta = np.arccos(np.dot(target_vec, cand_vec) /
-                      (np.linalg.norm(target_vec)*np.linalg.norm(cand_vec)+1e-8))
-    theta_deg = np.degrees(theta)
-    util = S_theta * np.cos(theta)
-    ax.text(0.02,0.98,f"θ={theta_deg:.1f}°",
+    corridor_tangent = np.array([1.0, 0.0], dtype=float)
+    cand_vec = np.array(hotspot, dtype=float) - ego_pos
+    cand_norm = np.linalg.norm(cand_vec) + 1e-8
+    alignment = float(np.dot(cand_vec / cand_norm, corridor_tangent))
+    util = S_theta * alignment
+    ax.text(0.02,0.98,f"m·t={alignment:.2f}, U={util:.2f}",
             transform=ax.transAxes, va="top", fontsize=9,
             bbox=dict(boxstyle="round", fc="wheat", alpha=0.8))
     ax.plot([ego_pos[0], hotspot[0]],[ego_pos[1],hotspot[1]],'c--',lw=2)
-    ax.plot([ego_pos[0], ego['target'][0]],[ego_pos[1], ego['target'][1]],'m-.',lw=2)
+    ax.plot([ego_pos[0], ego_pos[0]+40.0],[ego_pos[1], ego_pos[1]],'m-.',lw=2)
 
 # MODIFIED: This function now accepts a y-coordinate directly instead of a hotspot tuple.
 def annotate_speed(ax, ego, hotspot_y, vehicles):
-    v_current = np.linalg.norm(ego['velocity'])
+    v_cand = np.linalg.norm(ego['velocity'])
     lane_idx = np.argmin([abs(hotspot_y - center) for center in lanes])
     target_lane_center = lanes[lane_idx]
     vehicles_in_lane = [v for v in vehicles if abs(v['position'][1] - target_lane_center) < lane_width / 2]
-    v_ref = np.mean([np.linalg.norm(v['velocity']) for v in vehicles_in_lane]) if vehicles_in_lane else v_desired
-    rho_g = v_ref/max(v_current,1e-5)
-    util = S_v * (rho_g / (1+abs(rho_g)**((xi_i-1)/2)))
-    ax.text(0.02,0.98,f"v={v_current:.1f}, ρ={rho_g:.2f}, U={util:.2f}",
+    v_des = np.mean([np.linalg.norm(v['velocity']) for v in vehicles_in_lane]) if vehicles_in_lane else v_desired
+    v_cand = max(float(v_cand), 0.0)
+    v_des = max(float(v_des), 1e-6)
+    rho = min(v_cand, v_des) / max(v_cand, v_des)
+    util = S_v * (rho / (1+abs(rho)**((xi_i-1)/2)))
+    ax.text(0.02,0.98,f"v_cand={v_cand:.1f}, v_des={v_des:.1f}, ρ={rho:.2f}, U={util:.2f}",
             transform=ax.transAxes, va="top", fontsize=9,
             bbox=dict(boxstyle="round", fc="wheat", alpha=0.8))
 
 def annotate_proximity(ax, ego, hotspot):
     v_i = np.linalg.norm(ego['velocity'])
-    H_p = kappa * v_i
-    d_eff = abs(hotspot[0] - ego['target'][0]) + abs(hotspot[1] - ego['target'][1])
+    H_p = max(kappa * v_i, 1e-6)
+    ego_pos = ego['position']
+    cand = np.array(hotspot, dtype=float)
+    dest = ego['target']
+    tangent = np.array([1.0, 0.0], dtype=float)
+    normal = np.array([0.0, 1.0], dtype=float)
+    d_s = abs(((cand - ego_pos) @ tangent) - ((dest - ego_pos) @ tangent))
+    d_n = abs(((cand - ego_pos) @ normal) - ((dest - ego_pos) @ normal))
+    d_eff = d_s + d_n
     util = S_d / (1+(d_eff/H_p)**gamma)
     ax.text(0.02,0.98,f"d_eff={d_eff:.1f}, H_p={H_p:.1f}\nU={util:.2f}",
             transform=ax.transAxes, va="top", fontsize=9,
@@ -422,20 +444,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 import itertools
 
-def directional_utility(S_theta, theta_i_deg):
-    """Directional utility (paper Eq. 5): U_dir = S_theta * cos(theta - theta_goal).
-    theta_i_deg is the heading error (theta - theta_goal) in degrees."""
-    theta_i_rad = np.deg2rad(theta_i_deg)
-    return S_theta * np.cos(theta_i_rad)
+def directional_utility(S_theta, alignment_cos):
+    """Corridor-frame direction utility: U_dir = S_theta * (m_hat · t_hat)."""
+    return S_theta * alignment_cos
 
 # --- Define parameters to vary ---
 params_to_vary = {
     'S_theta': np.linspace(0.2, 1.0, 50),
-    'theta_i_deg': np.linspace(-90, 90, 50)
+    'alignment_cos': np.linspace(-1.0, 1.0, 50)
 }
 
 # Fixed values
-fixed_values = {'S_theta': 1.0, 'theta_i_deg': 0}
+fixed_values = {'S_theta': 1.0, 'alignment_cos': 1.0}
 
 # --- Generate parameter pairs ---
 param_pairs = list(itertools.combinations(params_to_vary.keys(), 2))
@@ -444,7 +464,7 @@ print(f"Generating {len(param_pairs)} heatmaps for Directional Alignment Utility
 # --- Mapping for pretty LaTeX labels ---
 label_map = {
     'S_theta': r'$S_\theta$',
-    'theta_i_deg': r'$\theta_i - \theta_{goal}$ (degrees)'
+    'alignment_cos': r'$\hat{m}\cdot\hat{t}$'
 }
 
 # --- Plot loop ---
@@ -470,18 +490,23 @@ import matplotlib.pyplot as plt
 import numpy as np
 import itertools
 
-def speed_utility(S_v, rho_g, xi_i):
-    """Calculates speed incentive utility."""
-    return S_v * (rho_g / (1 + np.abs(rho_g) ** ((xi_i - 1) / 2)))
+def speed_utility(S_v, v_cand, v_des, xi_i):
+    """Symmetric candidate-speed vs desired-speed utility."""
+    v_cand = np.maximum(v_cand, 0.0)
+    v_des = np.maximum(v_des, 1e-6)
+    rho = np.minimum(v_cand, v_des) / np.maximum(v_cand, v_des)
+    rho = np.maximum(rho, 1e-6)
+    return S_v * (rho / (1 + np.abs(rho) ** ((xi_i - 1) / 2)))
 
 # --- Define parameters to vary ---
 params_to_vary = {
-    'rho_g': np.linspace(0.1, 2.5, 50),
+    'v_cand': np.linspace(0.0, 25.0, 50),
+    'v_des': np.linspace(2.0, 25.0, 50),
     'xi_i': np.linspace(1.5, 4.0, 50)
 }
 
 # Fixed values
-fixed_values = {'S_v': 1.0, 'rho_g': 1.1, 'xi_i': 2.5}
+fixed_values = {'S_v': 1.0, 'v_cand': 10.0, 'v_des': 12.0, 'xi_i': 2.5}
 
 # --- Generate all unique pairs of parameters ---
 param_pairs = list(itertools.combinations(params_to_vary.keys(), 2))
@@ -489,7 +514,8 @@ print(f"Generating {len(param_pairs)} heatmaps for Speed Incentive Utility...")
 
 # --- Mapping for LaTeX-style axis labels ---
 label_map = {
-    'rho_g': r'$\rho_g$',
+    'v_cand': r'$v_{\mathrm{cand}}$',
+    'v_des': r'$v_{\mathrm{des}}$',
     'xi_i': r'$\xi_i$'
 }
 
