@@ -451,7 +451,7 @@ problem = {
 # Step 2: Generate samples
 # For actual analysis, increase N_samples significantly (e.g., 1024, 2048, or your planned 2000).
 # Using N_samples = 64 for a quick demonstration run.
-N_samples = 64
+N_samples = 4096
 param_values = sobol_sample.sample(problem, N_samples, calc_second_order=False)
 
 print(f"Generated {param_values.shape[0]} parameter samples for GSA with updated ranges.")
