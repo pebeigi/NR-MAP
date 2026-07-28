@@ -1,0 +1,1851 @@
+#!/usr/bin/env python
+"""Calibrate utility-parameter ranges from observed trajectories.
+
+The main target is short-horizon closed-loop tracking: start from an observed
+state, repeatedly let the utility model choose controls, and fit parameters that
+keep the simulated rollout close to the observed trajectory. A one-step choice
+likelihood is kept as a diagnostic and optional regularizer.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import Calibration._paths  # noqa: F401 — repo root on sys.path
+from Calibration._paths import REPO_ROOT
+from RL.traffic_env import EnvConfig
+from utility_model import (
+    UTILITY_PARAM_KEYS,
+    CorridorGeometry,
+    TrafficAgent,
+    generate_candidate_actions,
+)
+
+
+PARAM_BOUNDS: dict[str, tuple[float, float]] = {
+    "S_theta": (0.05, 10.0),
+    "S_v": (0.05, 10.0),
+    "xi_i": (1.1, 10.0),
+    "S_d": (0.05, 10.0),
+    "gamma": (0.1, 10.0),
+    "w_x": (0.1, 10.0),
+    "w_y": (0.1, 10.0),
+    "w_c": (0.01, 1000.0),
+    "w_ell": (0.1, 1000.0),
+    "beta": (0.01, 10.0),
+}
+
+
+@dataclass
+class ChoiceSample:
+    run_id: int
+    lane_kf: int
+    vehicle_id: int
+    time: float
+    dir_cos: np.ndarray
+    cand_speed: np.ndarray
+    dist_abs: np.ndarray
+    collision_prob: np.ndarray
+    path_error: np.ndarray
+    current_speed: float
+    desired_speed: float
+    target_index: int
+    target_match_cost: float
+
+
+@dataclass
+class RolloutWindow:
+    run_id: int
+    lane_kf: int
+    vehicle_id: int
+    rows: list[dict[str, Any]]
+
+
+# typing.Dict/Tuple: this is a runtime alias (not postponed by __future__ annotations).
+# Required for Python 3.8 compatibility.
+BoundaryMap = Dict[Tuple[int, int], pd.DataFrame]
+
+
+def log_progress(message: str, verbose: bool) -> None:
+    if verbose:
+        print(message, flush=True)
+
+
+def angle_diff(a: np.ndarray, b: float) -> np.ndarray:
+    return np.arctan2(np.sin(a - b), np.cos(a - b))
+
+
+def pca_axis(xy: np.ndarray) -> np.ndarray:
+    centered = xy - xy.mean(axis=0)
+    if len(centered) < 3:
+        return np.array([1.0, 0.0], dtype=float)
+    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    axis = vt[0].astype(float)
+    return axis / max(np.linalg.norm(axis), 1e-12)
+
+
+def load_boundary_map(boundary_csv: Path | None) -> BoundaryMap:
+    if boundary_csv is None or not boundary_csv.exists():
+        return {}
+    df = pd.read_csv(boundary_csv)
+    need = {
+        "run_id",
+        "lane_kf",
+        "point_index",
+        "center_x",
+        "center_y",
+        "lower_x",
+        "lower_y",
+        "upper_x",
+        "upper_y",
+    }
+    if not need.issubset(df.columns):
+        return {}
+    return {
+        (int(run_id), int(lane_kf)): group.sort_values("point_index").reset_index(drop=True)
+        for (run_id, lane_kf), group in df.groupby(["run_id", "lane_kf"], sort=True)
+    }
+
+
+def corridor_geometry_from_map(
+    run_id: int,
+    lane_kf: int,
+    boundary_map: BoundaryMap,
+) -> CorridorGeometry | None:
+    boundary = boundary_map.get((int(run_id), int(lane_kf)))
+    if boundary is None:
+        return None
+    center = boundary[["center_x", "center_y"]].to_numpy(float)
+    return CorridorGeometry.from_center(center)
+
+
+def project_points_on_corridor(
+    corridor: CorridorGeometry,
+    points: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    s_vals = np.zeros(len(points), dtype=float)
+    n_vals = np.zeros(len(points), dtype=float)
+    tangents = np.zeros((len(points), 2), dtype=float)
+    for idx, point in enumerate(points):
+        s_vals[idx], n_vals[idx], tangents[idx] = corridor.project(point)
+    return s_vals, n_vals, tangents
+
+
+def corridor_choice_features(
+    ego_pos: np.ndarray,
+    cand_pos: np.ndarray,
+    reference_pos: np.ndarray,
+    dest_pos: np.ndarray,
+    corridor: CorridorGeometry | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Direction + Frenet distance features for each candidate."""
+    move = cand_pos - ego_pos
+    move_norm = np.linalg.norm(move, axis=1)
+    if corridor is not None:
+        _, _, tangent_at_ego = corridor.project(ego_pos)
+        dir_cos = np.zeros(len(cand_pos), dtype=float)
+        valid = move_norm > 1e-6
+        dir_cos[valid] = (move[valid] / move_norm[valid, None]) @ tangent_at_ego
+        dir_cos[~valid] = 1.0
+        ref_s, ref_n, _ = corridor.project(reference_pos)
+        cand_s, cand_n, _ = project_points_on_corridor(corridor, cand_pos)
+        dist_abs = np.column_stack([np.abs(cand_s - ref_s), np.abs(cand_n - ref_n)])
+        return dir_cos, dist_abs
+
+    dest_vec = dest_pos - cand_pos
+    dest_norm = np.linalg.norm(dest_vec, axis=1)
+    valid = (move_norm > 1e-6) & (dest_norm > 1e-6)
+    dir_cos = np.zeros(len(cand_pos), dtype=float)
+    dir_cos[valid] = np.einsum(
+        "ij,ij->i",
+        move[valid] / move_norm[valid, None],
+        dest_vec[valid] / dest_norm[valid, None],
+    )
+    dir_cos[~valid] = 1.0
+    dist_abs = np.abs(cand_pos - dest_pos)
+    return dir_cos, dist_abs
+
+
+def closest_boundary_points(points: np.ndarray, boundary: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """Interpolate lower/upper boundary points at closest centerline segment for each point."""
+    center = boundary[["center_x", "center_y"]].to_numpy(float)
+    lower = boundary[["lower_x", "lower_y"]].to_numpy(float)
+    upper = boundary[["upper_x", "upper_y"]].to_numpy(float)
+    if len(center) < 2:
+        return np.repeat(lower[:1], len(points), axis=0), np.repeat(upper[:1], len(points), axis=0)
+
+    out_lower = np.zeros((len(points), 2), dtype=float)
+    out_upper = np.zeros((len(points), 2), dtype=float)
+    for p_idx, point in enumerate(points):
+        best_dist = float("inf")
+        best_i = 0
+        best_t = 0.0
+        for i in range(len(center) - 1):
+            a = center[i]
+            b = center[i + 1]
+            ab = b - a
+            denom = float(ab @ ab) + 1e-12
+            t = float(np.clip(((point - a) @ ab) / denom, 0.0, 1.0))
+            q = a + t * ab
+            dist = float(np.linalg.norm(point - q))
+            if dist < best_dist:
+                best_dist = dist
+                best_i = i
+                best_t = t
+        out_lower[p_idx] = (1.0 - best_t) * lower[best_i] + best_t * lower[best_i + 1]
+        out_upper[p_idx] = (1.0 - best_t) * upper[best_i] + best_t * upper[best_i + 1]
+    return out_lower, out_upper
+
+
+def boundary_path_error(
+    candidate_pos: np.ndarray,
+    run_id: int,
+    lane_kf: int,
+    boundary_map: BoundaryMap,
+    boundary_buffer: float = 1.5,
+) -> np.ndarray:
+    """
+    Boundary-aware path error for calibration.
+
+    Inside the corridor, the error is only positive within boundary_buffer meters
+    from either edge. Outside the corridor, it grows with the outside distance.
+    """
+    boundary = boundary_map.get((int(run_id), int(lane_kf)))
+    if boundary is None:
+        return np.zeros(len(candidate_pos), dtype=float)
+    lower, upper = closest_boundary_points(candidate_pos, boundary)
+    mid = 0.5 * (lower + upper)
+    lateral_vec = upper - lower
+    width = np.linalg.norm(lateral_vec, axis=1)
+    unit = lateral_vec / np.maximum(width[:, None], 1e-9)
+    signed = np.einsum("ij,ij->i", candidate_pos - mid, unit)
+    half_width = 0.5 * width
+    clearance = half_width - np.abs(signed)
+    return np.where(clearance >= 0.0, np.maximum(0.0, boundary_buffer - clearance), -clearance + boundary_buffer)
+
+
+def boundary_summary(df: pd.DataFrame) -> dict[str, Any]:
+    """Robust run/lane highway envelope in PCA Frenet coordinates."""
+    out: dict[str, Any] = {}
+    for (run_id, lane_kf), group in df.groupby(["run_id", "lane_kf"], sort=True):
+        xy = group[["xloc_kf", "yloc_kf"]].to_numpy(float)
+        origin = xy.mean(axis=0)
+        tangent = pca_axis(xy)
+        normal = np.array([-tangent[1], tangent[0]], dtype=float)
+        st = (xy - origin) @ np.column_stack([tangent, normal])
+        out[f"run_{int(run_id)}_lane_{int(lane_kf)}"] = {
+            "run_id": int(run_id),
+            "lane_kf": int(lane_kf),
+            "origin_xy": origin.tolist(),
+            "tangent_xy": tangent.tolist(),
+            "normal_xy": normal.tolist(),
+            "s_min_p01": float(np.quantile(st[:, 0], 0.01)),
+            "s_max_p99": float(np.quantile(st[:, 0], 0.99)),
+            "lateral_min_p01": float(np.quantile(st[:, 1], 0.01)),
+            "lateral_max_p99": float(np.quantile(st[:, 1], 0.99)),
+            "lateral_min_p005": float(np.quantile(st[:, 1], 0.005)),
+            "lateral_max_p995": float(np.quantile(st[:, 1], 0.995)),
+        }
+    return out
+
+
+def load_and_prepare(csv_path: Path, class_id: float | None) -> pd.DataFrame:
+    cols = [
+        "id",
+        "time",
+        "xloc_kf",
+        "yloc_kf",
+        "lane_kf",
+        "speed_kf",
+        "acceleration_kf",
+        "class",
+        "run_id",
+    ]
+    df = pd.read_csv(csv_path, usecols=cols)
+    if class_id is not None:
+        df = df[df["class"] == class_id].copy()
+    df = df.dropna(subset=["id", "time", "xloc_kf", "yloc_kf", "speed_kf", "run_id"])
+    df = df.sort_values(["run_id", "id", "time"]).reset_index(drop=True)
+    group = df.groupby(["run_id", "id"], sort=False)
+
+    for col in ("xloc_kf", "yloc_kf", "speed_kf", "time"):
+        df[f"next_{col}"] = group[col].shift(-1)
+    df["final_x"] = group["xloc_kf"].transform("last")
+    df["final_y"] = group["yloc_kf"].transform("last")
+    df["nominal_y"] = group["yloc_kf"].transform("median")
+    df["desired_speed"] = group["speed_kf"].transform(lambda s: float(np.quantile(s, 0.85)))
+
+    dx = df["next_xloc_kf"] - df["xloc_kf"]
+    dy = df["next_yloc_kf"] - df["yloc_kf"]
+    df["dt"] = df["next_time"] - df["time"]
+    df["heading"] = np.arctan2(dy, dx)
+    df["vx"] = df["speed_kf"] * np.cos(df["heading"])
+    df["vy"] = df["speed_kf"] * np.sin(df["heading"])
+
+    valid = (
+        df["next_xloc_kf"].notna()
+        & df["next_yloc_kf"].notna()
+        & df["dt"].between(0.05, 0.2)
+        & (df["speed_kf"] > 0.5)
+        & np.isfinite(df["heading"])
+    )
+    return df[valid].copy()
+
+
+def make_agent(row: pd.Series, agent_id: int) -> TrafficAgent:
+    vel = np.array([row["vx"], row["vy"]], dtype=float)
+    return TrafficAgent(
+        agent_id=agent_id,
+        pos=np.array([row["xloc_kf"], row["yloc_kf"]], dtype=float),
+        vel=vel,
+        dest=np.array([row["final_x"], row["final_y"]], dtype=float),
+        desired_speed=float(row["desired_speed"]),
+        nominal_y=float(row["nominal_y"]),
+        run_id=int(row["run_id"]),
+        lane_kf=int(row["lane_kf"]),
+        utility_reference_pos=np.array([row["next_xloc_kf"], row["next_yloc_kf"]], dtype=float),
+        heading_angle=float(row["heading"]),
+    )
+
+
+def collision_probability(
+    cand_pos: np.ndarray,
+    neighbors: list[TrafficAgent],
+    dt: float,
+    variances: np.ndarray,
+) -> np.ndarray:
+    if not neighbors:
+        return np.zeros(len(cand_pos), dtype=float)
+    det_sigma = variances[0] * variances[1]
+    pdf_norm = 1.0 / ((2 * np.pi) * np.sqrt(det_sigma + 1e-18))
+    inv_sigma = np.diag(1.0 / (variances + 1e-9))
+    p_sum = np.zeros(len(cand_pos), dtype=float)
+    for other in neighbors:
+        mu = other.pos + other.vel * dt
+        diff = cand_pos - mu
+        mahal_sq = np.einsum("ij,jk,ik->i", diff, inv_sigma, diff)
+        p_sum += pdf_norm * np.exp(-0.5 * mahal_sq)
+    return np.minimum(p_sum, 1.0)
+
+
+def observed_neighbors(
+    same_time: pd.DataFrame | None,
+    ego_pos: np.ndarray,
+    ego_id: int | float,
+    neighbor_radius: float,
+    max_neighbors: int,
+) -> list[TrafficAgent]:
+    if same_time is None or len(same_time) < 2:
+        return []
+    dx = same_time["xloc_kf"].to_numpy(float) - float(ego_pos[0])
+    dy = same_time["yloc_kf"].to_numpy(float) - float(ego_pos[1])
+    dist = np.hypot(dx, dy)
+    mask = (same_time["id"].to_numpy() != ego_id) & (dist <= neighbor_radius)
+    neighbor_rows = same_time.loc[mask].assign(_dist=dist[mask]).sort_values("_dist").head(max_neighbors)
+    return [make_agent(nrow, i + 1) for i, (_, nrow) in enumerate(neighbor_rows.iterrows())]
+
+
+def build_choice_sample(
+    row: pd.Series,
+    same_time: pd.DataFrame,
+    sim_config: dict[str, Any],
+    neighbor_radius: float,
+    max_neighbors: int,
+    boundary_map: BoundaryMap,
+) -> ChoiceSample | None:
+    ego = make_agent(row, 0)
+    dt = float(row["dt"])
+    sim_config = dict(sim_config)
+    sim_config["dt"] = dt
+
+    neighbors = observed_neighbors(
+        same_time,
+        ego.pos,
+        ego_id=row["id"],
+        neighbor_radius=neighbor_radius,
+        max_neighbors=max_neighbors,
+    )
+
+    candidates = generate_candidate_actions(ego, dt, sim_config)
+    cand_pos = np.vstack([c["pos"] for c in candidates])
+    cand_speed = np.array([float(c["speed"]) for c in candidates], dtype=float)
+    cand_heading = np.array([float(c["heading"]) for c in candidates], dtype=float)
+
+    actual_next = np.array([row["next_xloc_kf"], row["next_yloc_kf"]], dtype=float)
+    actual_speed = float(row["next_speed_kf"])
+    actual_heading = float(row["heading"])
+    match_cost = (
+        np.linalg.norm(cand_pos - actual_next, axis=1)
+        + 0.5 * np.abs(cand_speed - actual_speed)
+        + 0.5 * np.abs(angle_diff(cand_heading, actual_heading))
+    )
+    target_index = int(np.argmin(match_cost))
+
+    corridor = corridor_geometry_from_map(int(row["run_id"]), int(row["lane_kf"]), boundary_map)
+    reference_pos = actual_next
+    dir_cos, dist_abs = corridor_choice_features(
+        ego.pos,
+        cand_pos,
+        reference_pos,
+        ego.dest,
+        corridor,
+    )
+
+    variances = np.array(sim_config["collision_pred_variances"], dtype=float)
+    p_collision = collision_probability(cand_pos, neighbors, dt, variances)
+    path_error = boundary_path_error(
+        cand_pos,
+        run_id=int(row["run_id"]),
+        lane_kf=int(row["lane_kf"]),
+        boundary_map=boundary_map,
+        boundary_buffer=float(sim_config.get("boundary_buffer", 1.5)),
+    )
+    if not np.any(np.isfinite(path_error)) or np.allclose(path_error, 0.0):
+        path_error = np.abs(cand_pos[:, 1] - float(row["nominal_y"]))
+
+    return ChoiceSample(
+        run_id=int(row["run_id"]),
+        lane_kf=int(row["lane_kf"]),
+        vehicle_id=int(row["id"]),
+        time=float(row["time"]),
+        dir_cos=dir_cos,
+        cand_speed=cand_speed,
+        dist_abs=dist_abs,
+        collision_prob=p_collision,
+        path_error=path_error,
+        current_speed=float(row["speed_kf"]),
+        desired_speed=float(row["desired_speed"]),
+        target_index=target_index,
+        target_match_cost=float(match_cost[target_index]),
+    )
+
+
+def sample_choices(
+    df: pd.DataFrame,
+    args: argparse.Namespace,
+    sim_config: dict[str, Any],
+    boundary_map: BoundaryMap,
+) -> list[ChoiceSample]:
+    rng = np.random.default_rng(args.seed)
+    if len(df) > args.n_samples * 20:
+        candidate_rows = df.sample(n=args.n_samples * 20, random_state=args.seed)
+    else:
+        candidate_rows = df
+
+    grouped = {key: group for key, group in df.groupby(["run_id", "time"], sort=False)}
+    samples: list[ChoiceSample] = []
+    log_progress(
+        f"Building up to {args.n_samples} choice samples from {len(candidate_rows)} candidate rows...",
+        args.verbose,
+    )
+    next_report = max(args.n_samples // 10, 1)
+    for _, row in candidate_rows.sample(frac=1.0, random_state=args.seed).iterrows():
+        key = (row["run_id"], row["time"])
+        same_time = grouped.get(key)
+        if same_time is None or len(same_time) < 2:
+            continue
+        sample = build_choice_sample(
+            row,
+            same_time,
+            sim_config,
+            neighbor_radius=args.neighbor_radius,
+            max_neighbors=args.max_neighbors,
+            boundary_map=boundary_map,
+        )
+        if sample is not None:
+            samples.append(sample)
+            if args.verbose and len(samples) % next_report == 0:
+                log_progress(f"  choice samples: {len(samples)}/{args.n_samples}", args.verbose)
+        if len(samples) >= args.n_samples:
+            break
+    rng.shuffle(samples)
+    log_progress(f"Built {len(samples)} choice samples.", args.verbose)
+    return samples
+
+
+def utility_values(sample: ChoiceSample, params: dict[str, float]) -> np.ndarray:
+    v_cand = np.maximum(sample.cand_speed, 0.0)
+    v_des = max(sample.desired_speed, 1e-6)
+    rho = np.minimum(v_cand, v_des) / np.maximum(v_cand, v_des)
+    rho = np.maximum(rho, 1e-6)
+    exponent = (params["xi_i"] - 1.0) / 2.0
+    speed_term = rho / (1.0 + rho**exponent)
+
+    d_eff = params["w_x"] * sample.dist_abs[:, 0] + params["w_y"] * sample.dist_abs[:, 1]
+    h_p = max(2.0 * sample.current_speed, 5.0)
+    distance_term = 1.0 / (1.0 + (d_eff / h_p) ** params["gamma"])
+    path_penalty = 1.0 - np.exp(-params["beta"] * sample.path_error**2)
+
+    return (
+        params["S_theta"] * sample.dir_cos
+        + params["S_v"] * speed_term
+        + params["S_d"] * distance_term
+        - params["w_c"] * sample.collision_prob
+        - params["w_ell"] * path_penalty
+    )
+
+
+def candidate_features_for_state(
+    agent: TrafficAgent,
+    neighbors: list[TrafficAgent],
+    sim_config: dict[str, Any],
+    run_id: int,
+    lane_kf: int,
+    boundary_map: BoundaryMap,
+    reference_pos: np.ndarray | None = None,
+) -> tuple[list[dict[str, Any]], ChoiceSample]:
+    candidates = generate_candidate_actions(agent, sim_config["dt"], sim_config)
+    cand_pos = np.vstack([c["pos"] for c in candidates])
+    cand_speed = np.array([float(c["speed"]) for c in candidates], dtype=float)
+
+    if reference_pos is None:
+        reference_pos = agent.utility_reference_pos
+    if reference_pos is None:
+        reference_pos = agent.dest
+    corridor = corridor_geometry_from_map(run_id, lane_kf, boundary_map)
+    dir_cos, dist_abs = corridor_choice_features(
+        agent.pos,
+        cand_pos,
+        np.asarray(reference_pos, dtype=float),
+        agent.dest,
+        corridor,
+    )
+
+    variances = np.array(sim_config["collision_pred_variances"], dtype=float)
+    p_collision = collision_probability(cand_pos, neighbors, sim_config["dt"], variances)
+    path_error = boundary_path_error(
+        cand_pos,
+        run_id=run_id,
+        lane_kf=lane_kf,
+        boundary_map=boundary_map,
+        boundary_buffer=float(sim_config.get("boundary_buffer", 1.5)),
+    )
+    if not np.any(np.isfinite(path_error)) or np.allclose(path_error, 0.0):
+        path_error = np.abs(cand_pos[:, 1] - float(agent.nominal_y))
+
+    sample = ChoiceSample(
+        run_id=run_id,
+        lane_kf=lane_kf,
+        vehicle_id=agent.agent_id,
+        time=0.0,
+        dir_cos=dir_cos,
+        cand_speed=cand_speed,
+        dist_abs=dist_abs,
+        collision_prob=p_collision,
+        path_error=path_error,
+        current_speed=agent.speed,
+        desired_speed=agent.desired_speed,
+        target_index=0,
+        target_match_cost=0.0,
+    )
+    return candidates, sample
+
+
+def select_best_candidate_with_boundary(
+    agent: TrafficAgent,
+    neighbors: list[TrafficAgent],
+    params: dict[str, float],
+    sim_config: dict[str, Any],
+    run_id: int,
+    lane_kf: int,
+    boundary_map: BoundaryMap,
+    reference_pos: np.ndarray | None = None,
+) -> dict[str, Any]:
+    candidates, sample = candidate_features_for_state(
+        agent,
+        neighbors,
+        sim_config,
+        run_id,
+        lane_kf,
+        boundary_map,
+        reference_pos=reference_pos,
+    )
+    utilities = utility_values(sample, params)
+    return candidates[int(np.argmax(utilities))]
+
+
+def sample_rollout_windows(
+    df: pd.DataFrame,
+    n_windows: int,
+    horizon_steps: int,
+    seed: int,
+) -> list[RolloutWindow]:
+    if n_windows <= 0 or horizon_steps <= 0:
+        return []
+
+    groups: list[tuple[int, int, list[dict[str, Any]]]] = []
+    starts: list[tuple[int, int]] = []
+    for (run_id, vehicle_id), group in df.groupby(["run_id", "id"], sort=True):
+        rows = group.sort_values("time").to_dict("records")
+        if len(rows) < 2:
+            continue
+        group_idx = len(groups)
+        groups.append((int(run_id), int(vehicle_id), rows))
+        starts.extend((group_idx, start) for start in range(len(rows) - 1))
+
+    if not starts:
+        return []
+
+    rng = np.random.default_rng(seed)
+    selected = rng.choice(len(starts), size=min(n_windows, len(starts)), replace=False)
+    windows: list[RolloutWindow] = []
+    for idx in selected:
+        group_idx, start = starts[int(idx)]
+        run_id, vehicle_id, rows = groups[group_idx]
+        end = min(start + horizon_steps + 1, len(rows))
+        window_rows = rows[start:end]
+        if len(window_rows) < 2:
+            continue
+        windows.append(
+            RolloutWindow(
+                run_id=run_id,
+                lane_kf=int(window_rows[0]["lane_kf"]),
+                vehicle_id=vehicle_id,
+                rows=window_rows,
+            )
+        )
+    return windows
+
+
+def rollout_loss(
+    windows: list[RolloutWindow],
+    grouped_by_time: dict[tuple[float, float], pd.DataFrame],
+    params: dict[str, float],
+    sim_config: dict[str, Any],
+    args: argparse.Namespace,
+    boundary_map: BoundaryMap,
+) -> float:
+    if not windows:
+        return 0.0
+
+    window_losses: list[float] = []
+    for window in windows:
+        agent = make_agent(window.rows[0], 0)
+        step_losses: list[float] = []
+        for row in window.rows[:-1]:
+            dt = float(row["dt"])
+            if not np.isfinite(dt) or dt <= 0:
+                continue
+            local_config = dict(sim_config)
+            local_config["dt"] = dt
+            same_time = grouped_by_time.get((row["run_id"], row["time"]))
+            neighbors = observed_neighbors(
+                same_time,
+                agent.pos,
+                ego_id=row["id"],
+                neighbor_radius=args.neighbor_radius,
+                max_neighbors=args.max_neighbors,
+            )
+            chosen = select_best_candidate_with_boundary(
+                agent,
+                neighbors,
+                params,
+                local_config,
+                run_id=int(row["run_id"]),
+                lane_kf=int(row["lane_kf"]),
+                boundary_map=boundary_map,
+            )
+            agent.update_state_from_candidate(chosen, dt, local_config["destination_threshold"])
+
+            observed_pos = np.array([row["next_xloc_kf"], row["next_yloc_kf"]], dtype=float)
+            pos_error = float(np.linalg.norm(agent.pos - observed_pos))
+            speed_error = abs(float(agent.speed) - float(row["next_speed_kf"]))
+            heading_error = abs(float(angle_diff(np.array([agent.heading]), float(row["heading"]))[0]))
+            step_losses.append(
+                pos_error
+                + args.closed_loop_speed_weight * speed_error
+                + args.closed_loop_heading_weight * heading_error
+            )
+        if step_losses:
+            window_losses.append(float(np.mean(step_losses)))
+
+    if not window_losses:
+        return 0.0
+    return float(np.mean(window_losses))
+
+
+def mean_target_rank(samples: list[ChoiceSample], params: dict[str, float]) -> float:
+    if not samples:
+        return 0.0
+    ranks: list[float] = []
+    for sample in samples:
+        utilities = utility_values(sample, params)
+        order = np.argsort(utilities)[::-1]
+        rank = int(np.where(order == sample.target_index)[0][0]) + 1
+        ranks.append(float(rank))
+    return float(np.mean(ranks))
+
+
+def calibration_objective(
+    samples: list[ChoiceSample],
+    windows: list[RolloutWindow],
+    grouped_by_time: dict[tuple[float, float], pd.DataFrame],
+    params: dict[str, float],
+    sim_config: dict[str, Any],
+    args: argparse.Namespace,
+    boundary_map: BoundaryMap,
+) -> tuple[float, float, float, float]:
+    one_step_loss = nll(samples, params, args.temperature) if samples and args.one_step_weight > 0 else 0.0
+    closed_loop_loss = (
+        rollout_loss(windows, grouped_by_time, params, sim_config, args, boundary_map)
+        if windows and args.closed_loop_weight > 0
+        else 0.0
+    )
+    tracking_loss = (
+        mean_target_rank(samples, params) / max(args.tracking_rank_normalizer, 1.0)
+        if samples and args.tracking_weight > 0
+        else 0.0
+    )
+    objective = (
+        args.one_step_weight * one_step_loss
+        + args.closed_loop_weight * closed_loop_loss
+        + args.tracking_weight * tracking_loss
+    )
+    return objective, one_step_loss, closed_loop_loss, tracking_loss
+
+
+def nll(samples: list[ChoiceSample], params: dict[str, float], temperature: float) -> float:
+    losses = []
+    temp = max(temperature, 1e-6)
+    for sample in samples:
+        logits = utility_values(sample, params) / temp
+        logits = logits - np.max(logits)
+        log_denom = np.log(np.exp(logits).sum() + 1e-12)
+        losses.append(float(-(logits[sample.target_index] - log_denom)))
+    return float(np.mean(losses))
+
+
+def random_params(rng: np.random.Generator) -> dict[str, float]:
+    return {
+        key: float(rng.uniform(low, high))
+        for key, (low, high) in PARAM_BOUNDS.items()
+    }
+
+
+def screen_params_by_one_step_nll(
+    rng: np.random.Generator,
+    samples: list[ChoiceSample],
+    n_trials: int,
+    args: argparse.Namespace,
+    keep_count: int,
+    verbose: bool = False,
+    label: str = "one-step screening",
+) -> list[tuple[float, dict[str, float]]]:
+    total_trials = max(n_trials, 1)
+    log_progress(
+        f"{label}: scoring {total_trials} random parameter sets on {len(samples)} samples...",
+        verbose,
+    )
+    pre_scored: list[tuple[float, dict[str, float]]] = []
+    report_every = max(total_trials // 10, 1)
+    best_so_far = float("inf")
+    for trial_idx in range(total_trials):
+        params = random_params(rng)
+        one_step_loss = nll(samples, params, args.temperature) if samples else 0.0
+        tracking_loss = (
+            mean_target_rank(samples, params) / max(args.tracking_rank_normalizer, 1.0)
+            if samples
+            else 0.0
+        )
+        score = args.one_step_weight * one_step_loss + args.tracking_weight * tracking_loss
+        pre_scored.append((score, params))
+        best_so_far = min(best_so_far, score)
+        if verbose and ((trial_idx + 1) % report_every == 0 or trial_idx + 1 == total_trials):
+            log_progress(
+                f"  {label}: {trial_idx + 1}/{total_trials} trials, best screen={best_so_far:.4f}",
+                verbose,
+            )
+    if keep_count <= 0:
+        return pre_scored
+    pre_scored.sort(key=lambda x: x[0])
+    kept = pre_scored[: min(keep_count, len(pre_scored))]
+    log_progress(
+        f"{label}: kept top {len(kept)} / {total_trials} by one-step + tracking screen",
+        verbose,
+    )
+    return kept
+
+
+def summarize_scored_trials(
+    scored: list[tuple[float, float, float, float, dict[str, float], int, int]],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Build best/robust summaries and identifiability metrics from scored trials."""
+    if not scored:
+        raise ValueError("No scored calibration trials to summarize")
+
+    scored = sorted(scored, key=lambda x: x[0])
+    best_objective, best_nll, best_closed_loop_loss, best_tracking_loss, best_params, _, _ = scored[0]
+    rank_norm = max(args.tracking_rank_normalizer, 1.0)
+
+    # Near-optimal cloud: trials within relative/absolute tolerance of the best objective.
+    rel_tol = float(getattr(args, "near_optimal_rel_tol", 0.05))
+    abs_tol = float(getattr(args, "near_optimal_abs_tol", 0.05))
+    obj_cut = best_objective + max(abs_tol, rel_tol * max(abs(best_objective), 1e-9))
+    near = [row for row in scored if row[0] <= obj_cut]
+    used_fallback_top = False
+    if len(near) < 3:
+        # Fall back to at least a small top set so robust stats are defined.
+        near = scored[: max(3, min(10, len(scored)))]
+        used_fallback_top = True
+
+    top_n = max(5, int(len(scored) * args.top_fraction))
+    top = scored[:top_n]
+
+    def _matrix(
+        rows: list[tuple[float, float, float, float, dict[str, float], int, int]]
+    ) -> dict[str, np.ndarray]:
+        return {
+            key: np.array([row[4][key] for row in rows], dtype=float)
+            for key in UTILITY_PARAM_KEYS
+        }
+
+    def _quantile_ranges(matrix: dict[str, np.ndarray]) -> dict[str, dict[str, float]]:
+        return {
+            key: {
+                "p05": float(np.quantile(values, 0.05)),
+                "p50": float(np.quantile(values, 0.50)),
+                "p95": float(np.quantile(values, 0.95)),
+                "p025": float(np.quantile(values, 0.025)),
+                "p975": float(np.quantile(values, 0.975)),
+            }
+            for key, values in matrix.items()
+        }
+
+    top_matrix = _matrix(top)
+    near_matrix = _matrix(near)
+    ranges = _quantile_ranges(top_matrix)
+    near_ranges = _quantile_ranges(near_matrix)
+
+    robust_params = {key: float(np.median(near_matrix[key])) for key in UTILITY_PARAM_KEYS}
+
+    # Re-score robust params is done by caller if needed; store placeholder metrics from medoids.
+    objectives = np.array([row[0] for row in scored], dtype=float)
+    near_objectives = np.array([row[0] for row in near], dtype=float)
+    param_cv = {}
+    for key in UTILITY_PARAM_KEYS:
+        vals = near_matrix[key]
+        param_cv[key] = float(np.std(vals, ddof=1) / max(abs(np.mean(vals)), 1e-9))
+
+    # Correlation among near-optimal params (identifiability / tradeoffs).
+    corr = np.corrcoef(np.vstack([near_matrix[k] for k in UTILITY_PARAM_KEYS]))
+    corr = np.nan_to_num(corr, nan=0.0)
+    strong_pairs = []
+    for i, ki in enumerate(UTILITY_PARAM_KEYS):
+        for j, kj in enumerate(UTILITY_PARAM_KEYS):
+            if j <= i:
+                continue
+            rho = float(corr[i, j])
+            if abs(rho) >= 0.5:
+                strong_pairs.append({"param_a": ki, "param_b": kj, "corr": rho})
+    strong_pairs.sort(key=lambda d: -abs(d["corr"]))
+
+    trials_out = []
+    for objective, one_step_loss, closed_loop_loss, tracking_loss, params, seed, restart in scored:
+        row_tuple = (objective, one_step_loss, closed_loop_loss, tracking_loss, params, seed, restart)
+        # Mark membership in the set actually used for robust_params.
+        in_near = any(
+            abs(objective - n[0]) < 1e-15
+            and seed == n[5]
+            and restart == n[6]
+            and all(abs(params[k] - n[4][k]) < 1e-12 for k in UTILITY_PARAM_KEYS)
+            for n in near
+        )
+        trials_out.append(
+            {
+                "objective": float(objective),
+                "nll": float(one_step_loss),
+                "closed_loop_loss": float(closed_loop_loss),
+                "tracking_rank": float(tracking_loss * rank_norm),
+                "seed": int(seed),
+                "restart": int(restart),
+                "near_optimal": bool(in_near),
+                **{key: float(params[key]) for key in UTILITY_PARAM_KEYS},
+            }
+        )
+
+    flatness_ratio = float(
+        (near_objectives.max() - near_objectives.min()) / max(abs(best_objective), 1e-9)
+    )
+    return {
+        "best_objective": float(best_objective),
+        "best_nll": float(best_nll),
+        "best_closed_loop_loss": float(best_closed_loop_loss),
+        "best_tracking_rank": float(best_tracking_loss * rank_norm),
+        "best_params": best_params,
+        "robust_params": robust_params,
+        "recommended_ranges_from_top_trials": ranges,
+        "near_optimal_ranges": near_ranges,
+        "top_trials": trials_out,
+        "identifiability": {
+            "n_scored_trials": len(scored),
+            "n_near_optimal": len(near),
+            "used_top_fallback_for_robust": used_fallback_top,
+            "objective_cutoff": float(obj_cut),
+            "near_optimal_rel_tol": rel_tol,
+            "near_optimal_abs_tol": abs_tol,
+            "best_objective": float(best_objective),
+            "near_optimal_objective_min": float(near_objectives.min()),
+            "near_optimal_objective_max": float(near_objectives.max()),
+            "near_optimal_objective_range_rel": flatness_ratio,
+            "all_objective_p50": float(np.median(objectives)),
+            "all_objective_p95": float(np.quantile(objectives, 0.95)),
+            "param_cv_near_optimal": param_cv,
+            "strong_param_correlations": strong_pairs[:15],
+            "verdict": (
+                "non_identifiable_flat_ridge"
+                if flatness_ratio <= 0.10 and len(near) >= 5
+                else (
+                    "weakly_identified"
+                    if flatness_ratio <= 0.20
+                    else "more_peaked_or_under_explored"
+                )
+            ),
+        },
+        "n_samples": 0,  # filled by caller
+        "n_rollout_windows": 0,
+        "closed_loop_candidates": len(scored),
+        "closed_loop_horizon_steps": args.closed_loop_horizon_steps,
+        "one_step_weight": args.one_step_weight,
+        "closed_loop_weight": args.closed_loop_weight,
+        "tracking_weight": args.tracking_weight,
+        "utility_frame": "corridor",
+        "n_trials": args.n_trials,
+        "top_fraction": args.top_fraction,
+        "temperature": args.temperature,
+        "n_restarts": int(getattr(args, "n_restarts", 1)),
+    }
+
+
+def calibrate_once(
+    samples: list[ChoiceSample],
+    windows: list[RolloutWindow],
+    grouped_by_time: dict[tuple[float, float], pd.DataFrame],
+    sim_config: dict[str, Any],
+    args: argparse.Namespace,
+    boundary_map: BoundaryMap,
+    seed: int,
+    restart: int,
+) -> list[tuple[float, float, float, float, dict[str, float], int, int]]:
+    """Run one random-search calibration restart; return scored closed-loop trials."""
+    rng = np.random.default_rng(seed)
+    closed_loop_candidates = min(max(args.closed_loop_candidates, 1), max(args.n_trials, 1))
+    candidates = screen_params_by_one_step_nll(
+        rng,
+        samples,
+        n_trials=args.n_trials,
+        args=args,
+        keep_count=closed_loop_candidates,
+        verbose=args.verbose,
+        label=f"Global calibration (restart {restart + 1})",
+    )
+    scored: list[tuple[float, float, float, float, dict[str, float], int, int]] = []
+    log_progress(
+        f"Restart {restart + 1}: evaluating {len(candidates)} candidates with "
+        f"{len(windows)} closed-loop windows x {args.closed_loop_horizon_steps} steps...",
+        args.verbose,
+    )
+    for i, (_, params) in enumerate(candidates):
+        objective, one_step_loss, closed_loop_loss, tracking_loss = calibration_objective(
+            samples,
+            windows,
+            grouped_by_time,
+            params,
+            sim_config,
+            args,
+            boundary_map,
+        )
+        scored.append(
+            (objective, one_step_loss, closed_loop_loss, tracking_loss, params, seed, restart)
+        )
+        if args.verbose and (
+            (i + 1) % max(len(candidates) // 10, 1) == 0 or i + 1 == len(candidates)
+        ):
+            best = min(scored, key=lambda x: x[0])
+            log_progress(
+                f"  restart {restart + 1}: {i + 1}/{len(candidates)} candidates, "
+                f"best_objective={best[0]:.4f}, nll={best[1]:.4f}, "
+                f"rollout={best[2]:.4f}, tracking={best[3]:.4f}",
+                args.verbose,
+            )
+    return scored
+
+
+def evaluate_params_objective(
+    samples: list[ChoiceSample],
+    windows: list[RolloutWindow],
+    grouped_by_time: dict[tuple[float, float], pd.DataFrame],
+    params: dict[str, float],
+    sim_config: dict[str, Any],
+    args: argparse.Namespace,
+    boundary_map: BoundaryMap,
+) -> tuple[float, float, float, float]:
+    return calibration_objective(
+        samples,
+        windows,
+        grouped_by_time,
+        params,
+        sim_config,
+        args,
+        boundary_map,
+    )
+
+
+def calibrate(
+    samples: list[ChoiceSample],
+    windows: list[RolloutWindow],
+    grouped_by_time: dict[tuple[float, float], pd.DataFrame],
+    sim_config: dict[str, Any],
+    args: argparse.Namespace,
+    boundary_map: BoundaryMap,
+) -> dict[str, Any]:
+    """Multi-restart random search with robust near-optimal parameter aggregation."""
+    n_restarts = max(int(getattr(args, "n_restarts", 1)), 1)
+    all_scored: list[tuple[float, float, float, float, dict[str, float], int, int]] = []
+    for restart in range(n_restarts):
+        seed = int(args.seed) + restart
+        all_scored.extend(
+            calibrate_once(
+                samples,
+                windows,
+                grouped_by_time,
+                sim_config,
+                args,
+                boundary_map,
+                seed=seed,
+                restart=restart,
+            )
+        )
+
+    result = summarize_scored_trials(all_scored, args)
+    result["n_samples"] = len(samples)
+    result["n_rollout_windows"] = len(windows)
+
+    # Evaluate the robust (median near-optimal) parameter vector on the true objective.
+    robust_objective, robust_nll, robust_closed, robust_track = evaluate_params_objective(
+        samples,
+        windows,
+        grouped_by_time,
+        result["robust_params"],
+        sim_config,
+        args,
+        boundary_map,
+    )
+    result["robust_objective"] = float(robust_objective)
+    result["robust_nll"] = float(robust_nll)
+    result["robust_closed_loop_loss"] = float(robust_closed)
+    result["robust_tracking_rank"] = float(robust_track * max(args.tracking_rank_normalizer, 1.0))
+    result["working_params"] = result["robust_params"]
+    result["working_params_source"] = "median_of_near_optimal_trials"
+
+    idinfo = result["identifiability"]
+    log_progress(
+        "Identifiability: "
+        f"near-optimal={idinfo['n_near_optimal']}/{idinfo['n_scored_trials']}, "
+        f"obj_range_rel={idinfo['near_optimal_objective_range_rel']:.4f}, "
+        f"verdict={idinfo['verdict']}",
+        args.verbose,
+    )
+    log_progress(
+        f"Robust params objective={result['robust_objective']:.4f} "
+        f"(best={result['best_objective']:.4f})",
+        args.verbose,
+    )
+    return result
+
+
+def calibrate_local_params(
+    samples: list[ChoiceSample],
+    windows: list[RolloutWindow],
+    grouped_by_time: dict[tuple[float, float], pd.DataFrame],
+    sim_config: dict[str, Any],
+    args: argparse.Namespace,
+    boundary_map: BoundaryMap,
+    n_trials: int,
+    seed: int,
+) -> tuple[float, float, float, float, dict[str, float]]:
+    """Small random-search calibration for one vehicle ID diagnostic plot."""
+    if not samples and not windows:
+        raise ValueError("Cannot calibrate local parameters without samples or rollout windows")
+    rng = np.random.default_rng(seed)
+    keep_count = min(max(args.per_id_closed_loop_candidates, 1), max(n_trials, 1))
+    candidates = screen_params_by_one_step_nll(
+        rng,
+        samples,
+        n_trials=n_trials,
+        args=args,
+        keep_count=keep_count,
+        verbose=False,
+    )
+    best_objective = float("inf")
+    best_nll = float("inf")
+    best_closed_loop_loss = float("inf")
+    best_tracking_loss = float("inf")
+    best_params: dict[str, float] | None = None
+    for _, params in candidates:
+        objective, one_step_loss, closed_loop_loss, tracking_loss = calibration_objective(
+            samples,
+            windows,
+            grouped_by_time,
+            params,
+            sim_config,
+            args,
+            boundary_map,
+        )
+        if objective < best_objective:
+            best_objective = objective
+            best_nll = one_step_loss
+            best_closed_loop_loss = closed_loop_loss
+            best_tracking_loss = tracking_loss
+            best_params = params
+    assert best_params is not None
+    return best_objective, best_nll, best_closed_loop_loss, best_tracking_loss, best_params
+
+
+def plot_all_trajectories(
+    df: pd.DataFrame,
+    out_path: Path,
+    boundary_csv: Path | None = None,
+    max_points: int = 250_000,
+) -> None:
+    """XY overview of all trajectory points, colored by run/lane."""
+    plot_df = df
+    if len(plot_df) > max_points:
+        plot_df = plot_df.sample(n=max_points, random_state=0)
+
+    fig, ax = plt.subplots(figsize=(9, 8), constrained_layout=True)
+    for (run_id, lane_kf), group in plot_df.groupby(["run_id", "lane_kf"], sort=True):
+        ax.scatter(
+            group["xloc_kf"],
+            group["yloc_kf"],
+            s=1,
+            alpha=0.18,
+            label=f"run {int(run_id)}, lane {int(lane_kf)}",
+        )
+    if boundary_csv is not None and boundary_csv.exists():
+        bdf = pd.read_csv(boundary_csv)
+        group_cols = ["run_id", "lane_kf"] if "lane_kf" in bdf.columns else ["run_id"]
+        for key, group in bdf.groupby(group_cols, sort=True):
+            if isinstance(key, tuple):
+                run_id, lane_kf = key
+                label = f"run {int(run_id)}, lane {int(lane_kf)}"
+            else:
+                label = f"run {int(key)}"
+            ax.plot(group["lower_x"], group["lower_y"], lw=2, label=f"{label} lower")
+            ax.plot(group["upper_x"], group["upper_y"], lw=2, label=f"{label} upper")
+    ax.set_title("All vehicle trajectory points")
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, alpha=0.25)
+    ax.legend(markerscale=6, fontsize=8)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def samples_for_vehicle(
+    group: pd.DataFrame,
+    grouped_by_time: dict[tuple[float, float], pd.DataFrame],
+    sim_config: dict[str, Any],
+    args: argparse.Namespace,
+    boundary_map: BoundaryMap,
+) -> list[ChoiceSample]:
+    """Build observed-choice samples for a single vehicle."""
+    rows = group.sort_values("time")
+    if len(rows) > args.per_id_samples:
+        rows = rows.iloc[np.linspace(0, len(rows) - 1, args.per_id_samples).astype(int)]
+    samples: list[ChoiceSample] = []
+    for _, row in rows.iterrows():
+        same_time = grouped_by_time.get((row["run_id"], row["time"]))
+        if same_time is None or len(same_time) < 2:
+            continue
+        sample = build_choice_sample(
+            row,
+            same_time,
+            sim_config,
+            neighbor_radius=args.neighbor_radius,
+            max_neighbors=args.max_neighbors,
+            boundary_map=boundary_map,
+        )
+        if sample is not None:
+            samples.append(sample)
+    return samples
+
+
+def simulate_vehicle(
+    group: pd.DataFrame,
+    grouped_by_time: dict[tuple[float, float], pd.DataFrame],
+    params: dict[str, float],
+    sim_config: dict[str, Any],
+    neighbor_radius: float,
+    max_neighbors: int,
+    boundary_map: BoundaryMap,
+) -> pd.DataFrame:
+    """Closed-loop utility simulation for one vehicle against observed neighbors."""
+    group = group.sort_values("time")
+    rows = group.to_dict("records")
+    if not rows:
+        return pd.DataFrame()
+    first = pd.Series(rows[0])
+    agent = make_agent(first, 0)
+    sim_rows = [
+        {
+            "time": float(first["time"]),
+            "x": float(agent.pos[0]),
+            "y": float(agent.pos[1]),
+            "vx": float(agent.vel[0]),
+            "vy": float(agent.vel[1]),
+            "speed": float(agent.speed),
+        }
+    ]
+    for row_dict in rows[:-1]:
+        row = pd.Series(row_dict)
+        dt = float(row["dt"])
+        if not np.isfinite(dt) or dt <= 0:
+            continue
+        local_config = dict(sim_config)
+        local_config["dt"] = dt
+        same_time = grouped_by_time.get((row["run_id"], row["time"]))
+        neighbors = observed_neighbors(
+            same_time,
+            agent.pos,
+            ego_id=row["id"],
+            neighbor_radius=neighbor_radius,
+            max_neighbors=max_neighbors,
+        )
+        reference_pos = np.array([row["next_xloc_kf"], row["next_yloc_kf"]], dtype=float)
+        agent.run_id = int(row["run_id"])
+        agent.lane_kf = int(row["lane_kf"])
+        agent.utility_reference_pos = reference_pos
+        chosen = select_best_candidate_with_boundary(
+            agent,
+            neighbors,
+            params,
+            local_config,
+            run_id=int(row["run_id"]),
+            lane_kf=int(row["lane_kf"]),
+            boundary_map=boundary_map,
+            reference_pos=reference_pos,
+        )
+        agent.update_state_from_candidate(chosen, dt, local_config["destination_threshold"])
+        next_time = float(row["next_time"])
+        sim_rows.append(
+            {
+                "time": next_time,
+                "x": float(agent.pos[0]),
+                "y": float(agent.pos[1]),
+                "vx": float(agent.vel[0]),
+                "vy": float(agent.vel[1]),
+                "speed": float(agent.speed),
+            }
+        )
+    return pd.DataFrame(sim_rows)
+
+
+def params_text(params: dict[str, float]) -> str:
+    rows = [f"{k}={params[k]:.2g}" for k in UTILITY_PARAM_KEYS]
+    return "\n".join(rows)
+
+
+def plot_vehicle_simulated_vs_observed(
+    group: pd.DataFrame,
+    sim_df: pd.DataFrame,
+    params: dict[str, float],
+    local_nll: float,
+    out_path: Path,
+    boundary_map: BoundaryMap,
+) -> None:
+    """Per-ID observed vs simulated x-y, x(t), y(t), vx(t), vy(t), speed(t)."""
+    group = group.sort_values("time")
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9), constrained_layout=True)
+    t_obs = group["time"].to_numpy(float)
+    t_sim = sim_df["time"].to_numpy(float)
+
+    run_id = int(group["run_id"].iloc[0])
+    lane_kf = int(group["lane_kf"].iloc[0])
+    boundary = boundary_map.get((run_id, lane_kf))
+    obs_points = group[["xloc_kf", "yloc_kf"]].to_numpy(float)
+    sim_points = sim_df[["x", "y"]].to_numpy(float)
+    obs_lower = obs_upper = sim_lower = sim_upper = None
+    if boundary is not None:
+        obs_lower, obs_upper = closest_boundary_points(obs_points, boundary)
+        sim_lower, sim_upper = closest_boundary_points(sim_points, boundary)
+        axes[0, 0].plot(boundary["lower_x"], boundary["lower_y"], color="0.55", lw=2, label="boundary lower")
+        axes[0, 0].plot(boundary["upper_x"], boundary["upper_y"], color="0.25", lw=2, label="boundary upper")
+
+    axes[0, 0].plot(group["xloc_kf"], group["yloc_kf"], lw=2, label="observed")
+    axes[0, 0].plot(sim_df["x"], sim_df["y"], "--", lw=2, label="simulated")
+    axes[0, 0].set_xlabel("x (m)")
+    axes[0, 0].set_ylabel("y (m)")
+    axes[0, 0].set_aspect("equal", adjustable="box")
+    axes[0, 0].legend()
+
+    axes[0, 1].plot(t_obs, group["xloc_kf"], lw=1.5, label="observed")
+    axes[0, 1].plot(t_sim, sim_df["x"], "--", lw=1.5, label="simulated")
+    if obs_lower is not None and obs_upper is not None:
+        axes[0, 1].plot(t_obs, obs_lower[:, 0], ":", color="0.55", lw=1.2, label="obs lower/upper")
+        axes[0, 1].plot(t_obs, obs_upper[:, 0], ":", color="0.55", lw=1.2)
+    if sim_lower is not None and sim_upper is not None:
+        axes[0, 1].plot(t_sim, sim_lower[:, 0], "-.", color="0.25", lw=1.0, label="sim lower/upper")
+        axes[0, 1].plot(t_sim, sim_upper[:, 0], "-.", color="0.25", lw=1.0)
+    axes[0, 1].set_ylabel("x (m)")
+
+    axes[0, 2].plot(t_obs, group["yloc_kf"], lw=1.5, label="observed")
+    axes[0, 2].plot(t_sim, sim_df["y"], "--", lw=1.5, label="simulated")
+    if obs_lower is not None and obs_upper is not None:
+        axes[0, 2].plot(t_obs, obs_lower[:, 1], ":", color="0.55", lw=1.2, label="obs lower/upper")
+        axes[0, 2].plot(t_obs, obs_upper[:, 1], ":", color="0.55", lw=1.2)
+    if sim_lower is not None and sim_upper is not None:
+        axes[0, 2].plot(t_sim, sim_lower[:, 1], "-.", color="0.25", lw=1.0, label="sim lower/upper")
+        axes[0, 2].plot(t_sim, sim_upper[:, 1], "-.", color="0.25", lw=1.0)
+    axes[0, 2].set_ylabel("y (m)")
+
+    axes[1, 0].plot(t_obs, group["vx"], lw=1.5, label="observed")
+    axes[1, 0].plot(t_sim, sim_df["vx"], "--", lw=1.5, label="simulated")
+    axes[1, 0].set_ylabel("x speed vx (m/s)")
+    axes[1, 0].set_xlabel("time (s)")
+
+    axes[1, 1].plot(t_obs, group["vy"], lw=1.5, label="observed")
+    axes[1, 1].plot(t_sim, sim_df["vy"], "--", lw=1.5, label="simulated")
+    axes[1, 1].set_ylabel("y speed vy (m/s)")
+    axes[1, 1].set_xlabel("time (s)")
+
+    axes[1, 2].plot(t_obs, group["speed_kf"], lw=1.5, label="observed")
+    axes[1, 2].plot(t_sim, sim_df["speed"], "--", lw=1.5, label="simulated")
+    axes[1, 2].set_ylabel("speed (m/s)")
+    axes[1, 2].set_xlabel("time (s)")
+
+    for ax in axes.ravel():
+        ax.grid(True, alpha=0.3)
+
+    vehicle_id = int(group["id"].iloc[0])
+    fig.suptitle(
+        f"Observed vs simulated, ID {vehicle_id}, run {run_id}, lane_kf {lane_kf}, "
+        f"local NLL={local_nll:.3f}",
+        fontsize=13,
+    )
+    axes[0, 0].text(
+        1.04,
+        0.98,
+        "Best parameters for this ID:\n" + params_text(params),
+        transform=axes[0, 0].transAxes,
+        va="top",
+        ha="left",
+        fontsize=8,
+        family="monospace",
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.75},
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_id_timeseries(
+    df: pd.DataFrame,
+    out_dir: Path,
+    max_ids: int,
+    plot_all_ids: bool,
+    global_params: dict[str, float],
+    args: argparse.Namespace,
+) -> int:
+    """Create per-ID observed-vs-simulated plots; bounded by default."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cfg = EnvConfig()
+    cfg.sim_config["utility_frame"] = "corridor"
+    boundary_map = load_boundary_map(args.boundary_csv)
+    grouped_by_time = {key: group for key, group in df.groupby(["run_id", "time"], sort=False)}
+    groups = list(df.groupby(["run_id", "id"], sort=True))
+    if not plot_all_ids:
+        groups = groups[:max_ids]
+    param_rows = []
+    n_groups = len(groups)
+    log_progress(f"Per-ID diagnostics: processing {n_groups} vehicle(s)...", args.verbose)
+    report_every = max(n_groups // 10, 1)
+    for plot_idx, ((run_id, vehicle_id), group) in enumerate(groups, start=1):
+        local_samples = samples_for_vehicle(
+            group, grouped_by_time, cfg.sim_config, args, boundary_map
+        )
+        local_windows = sample_rollout_windows(
+            group,
+            n_windows=args.per_id_rollout_windows,
+            horizon_steps=args.closed_loop_horizon_steps,
+            seed=args.seed + int(vehicle_id),
+        )
+        if local_samples or local_windows:
+            (
+                local_objective,
+                local_nll,
+                local_closed_loop_loss,
+                local_tracking_loss,
+                local_params,
+            ) = calibrate_local_params(
+                local_samples,
+                local_windows,
+                grouped_by_time,
+                cfg.sim_config,
+                args,
+                boundary_map,
+                n_trials=args.per_id_trials,
+                seed=args.seed + int(vehicle_id),
+            )
+        else:
+            local_objective = float("nan")
+            local_nll = float("nan")
+            local_closed_loop_loss = float("nan")
+            local_tracking_loss = float("nan")
+            local_params = global_params
+        sim_df = simulate_vehicle(
+            group,
+            grouped_by_time,
+            local_params,
+            cfg.sim_config,
+            neighbor_radius=args.neighbor_radius,
+            max_neighbors=args.max_neighbors,
+            boundary_map=boundary_map,
+        )
+        plot_vehicle_simulated_vs_observed(
+            group,
+            sim_df,
+            local_params,
+            local_nll,
+            out_dir / f"run_{int(run_id):02d}_id_{int(vehicle_id):06d}_sim_vs_obs.png",
+            boundary_map=boundary_map,
+        )
+        row = {
+            "run_id": int(run_id),
+            "id": int(vehicle_id),
+            "lane_kf": int(group["lane_kf"].iloc[0]),
+            "local_objective": local_objective,
+            "local_nll": local_nll,
+            "local_closed_loop_loss": local_closed_loop_loss,
+            "local_tracking_rank": local_tracking_loss * max(args.tracking_rank_normalizer, 1.0),
+            "n_local_samples": len(local_samples),
+            "n_local_rollout_windows": len(local_windows),
+        }
+        row.update(local_params)
+        param_rows.append(row)
+        if args.verbose and (plot_idx % report_every == 0 or plot_idx == n_groups):
+            log_progress(f"  per-ID plots: {plot_idx}/{n_groups}", args.verbose)
+    pd.DataFrame(param_rows).to_csv(out_dir / "per_id_best_params.csv", index=False)
+    return len(groups)
+
+
+def calibration_quality_frame(
+    samples: list[ChoiceSample],
+    params: dict[str, float],
+    temperature: float,
+) -> pd.DataFrame:
+    rows = []
+    temp = max(temperature, 1e-6)
+    for sample in samples:
+        u = utility_values(sample, params)
+        logits = (u - np.max(u)) / temp
+        probs = np.exp(logits)
+        probs = probs / max(float(probs.sum()), 1e-12)
+        order = np.argsort(u)[::-1]
+        rank = int(np.where(order == sample.target_index)[0][0]) + 1
+        best_non_target = float(np.max(np.delete(u, sample.target_index)))
+        rows.append(
+            {
+                "run_id": sample.run_id,
+                "id": sample.vehicle_id,
+                "time": sample.time,
+                "target_rank": rank,
+                "target_probability": float(probs[sample.target_index]),
+                "target_margin": float(u[sample.target_index] - best_non_target),
+                "target_match_cost": sample.target_match_cost,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def plot_calibration_quality(qdf: pd.DataFrame, out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), constrained_layout=True)
+    axes[0].hist(qdf["target_rank"], bins=np.arange(1, qdf["target_rank"].max() + 2) - 0.5)
+    axes[0].set_title("Observed-like candidate rank")
+    axes[0].set_xlabel("rank (1 is best)")
+    axes[0].set_ylabel("count")
+    axes[1].hist(qdf["target_probability"], bins=30)
+    axes[1].set_title("Softmax probability of observed-like candidate")
+    axes[1].set_xlabel("probability")
+    axes[2].hist(qdf["target_margin"], bins=30)
+    axes[2].axvline(0.0, color="k", lw=1, ls="--")
+    axes[2].set_title("Utility margin vs best alternative")
+    axes[2].set_xlabel("U_target - max U_other")
+    for ax in axes:
+        ax.grid(True, alpha=0.25)
+    fig.savefig(out_dir / "calibration_quality.png", dpi=180)
+    plt.close(fig)
+
+
+def plot_parameter_ranges(result: dict[str, Any], out_dir: Path) -> None:
+    ranges = result["recommended_ranges_from_top_trials"]
+    keys = list(UTILITY_PARAM_KEYS)
+    med = np.array([ranges[k]["p50"] for k in keys], dtype=float)
+    lo = np.array([ranges[k]["p05"] for k in keys], dtype=float)
+    hi = np.array([ranges[k]["p95"] for k in keys], dtype=float)
+    fig, ax = plt.subplots(figsize=(11, 5), constrained_layout=True)
+    x = np.arange(len(keys))
+    ax.errorbar(x, med, yerr=[med - lo, hi - med], fmt="o", capsize=4)
+    ax.set_xticks(x)
+    ax.set_xticklabels(keys, rotation=35, ha="right")
+    ax.set_ylabel("parameter value")
+    ax.set_title("Recommended utility parameter ranges from top calibration trials")
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.savefig(out_dir / "parameter_ranges.png", dpi=180)
+    plt.close(fig)
+
+
+def plot_identifiability_diagnostics(result: dict[str, Any], out_dir: Path) -> None:
+    """Objective flatness, near-optimal parameter spreads, and tradeoff correlations."""
+    trials = result.get("top_trials") or []
+    if not trials:
+        return
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tdf = pd.DataFrame(trials)
+    near = tdf[tdf["near_optimal"]].copy() if "near_optimal" in tdf.columns else tdf.nsmallest(max(5, len(tdf) // 10), "objective")
+    if near.empty:
+        near = tdf.nsmallest(min(10, len(tdf)), "objective")
+
+    fig, axes = plt.subplots(2, 2, figsize=(12.5, 8.5), constrained_layout=True)
+
+    ax = axes[0, 0]
+    objs = np.sort(tdf["objective"].to_numpy(dtype=float))
+    ax.plot(np.arange(1, len(objs) + 1), objs, color="#4C78A8", lw=1.8)
+    cut = float(result.get("identifiability", {}).get("objective_cutoff", objs[0]))
+    ax.axhline(cut, color="#54A24B", ls="--", lw=1.3, label="near-optimal cutoff")
+    ax.axhline(objs[0], color="#E45756", ls=":", lw=1.2, label="best")
+    ax.set_xlabel("trial rank (best → worst)")
+    ax.set_ylabel("objective")
+    ax.set_title("Closed-loop objective spectrum")
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False)
+
+    ax = axes[0, 1]
+    keys = list(UTILITY_PARAM_KEYS)
+    cvs = [float(result["identifiability"]["param_cv_near_optimal"].get(k, np.nan)) for k in keys]
+    ax.bar(np.arange(len(keys)), cvs, color="#F58518")
+    ax.set_xticks(np.arange(len(keys)))
+    ax.set_xticklabels(keys, rotation=35, ha="right")
+    ax.set_ylabel("CV = std/|mean|")
+    ax.set_title("Parameter dispersion inside near-optimal set")
+    ax.grid(True, axis="y", alpha=0.25)
+
+    ax = axes[1, 0]
+    # Pair with strongest |corr| if available, else S_v vs S_theta.
+    pairs = result.get("identifiability", {}).get("strong_param_correlations") or []
+    if pairs:
+        ka, kb = pairs[0]["param_a"], pairs[0]["param_b"]
+        title = f"Strongest tradeoff: {ka} vs {kb} (corr={pairs[0]['corr']:.2f})"
+    else:
+        ka, kb = "S_v", "S_theta"
+        title = f"{ka} vs {kb} (near-optimal cloud)"
+    ax.scatter(tdf[ka], tdf[kb], s=18, alpha=0.25, c="#9ecae1", label="all scored")
+    ax.scatter(near[ka], near[kb], s=28, alpha=0.85, c="#E45756", label="near-optimal")
+    if "robust_params" in result:
+        ax.scatter(
+            [result["robust_params"][ka]],
+            [result["robust_params"][kb]],
+            s=90,
+            marker="D",
+            c="#54A24B",
+            label="robust",
+            zorder=3,
+        )
+    if "best_params" in result:
+        ax.scatter(
+            [result["best_params"][ka]],
+            [result["best_params"][kb]],
+            s=80,
+            marker="*",
+            c="#4C78A8",
+            label="best",
+            zorder=3,
+        )
+    ax.set_xlabel(ka)
+    ax.set_ylabel(kb)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False, fontsize=8)
+
+    ax = axes[1, 1]
+    mat = near[list(UTILITY_PARAM_KEYS)].to_numpy(dtype=float)
+    if len(near) >= 3:
+        corr = np.corrcoef(mat.T)
+        corr = np.nan_to_num(corr, nan=0.0)
+    else:
+        corr = np.eye(len(UTILITY_PARAM_KEYS))
+    im = ax.imshow(corr, vmin=-1, vmax=1, cmap="coolwarm", aspect="equal")
+    ax.set_xticks(np.arange(len(UTILITY_PARAM_KEYS)))
+    ax.set_yticks(np.arange(len(UTILITY_PARAM_KEYS)))
+    ax.set_xticklabels(UTILITY_PARAM_KEYS, rotation=35, ha="right", fontsize=8)
+    ax.set_yticklabels(UTILITY_PARAM_KEYS, fontsize=8)
+    ax.set_title("Near-optimal parameter correlations")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    fig.suptitle("Calibration identifiability diagnostics", y=1.02)
+    fig.savefig(out_dir / "identifiability_diagnostics.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    # Also dump the trial table for paper / external analysis.
+    tdf.to_csv(out_dir / "top_trials.csv", index=False)
+    near.to_csv(out_dir / "near_optimal_trials.csv", index=False)
+
+
+def working_params_from_result(result: dict[str, Any]) -> dict[str, float]:
+    if result.get("working_params"):
+        return result["working_params"]
+    if result.get("robust_params"):
+        return result["robust_params"]
+    return result["best_params"]
+
+
+def write_diagnostics(
+    df: pd.DataFrame,
+    samples: list[ChoiceSample],
+    result: dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    diag_dir = args.diagnostics_dir
+    diag_dir.mkdir(parents=True, exist_ok=True)
+    work_params = working_params_from_result(result)
+    log_progress("Diagnostics: writing all-agents XY plot...", args.verbose)
+    plot_all_trajectories(df, diag_dir / "all_agents_xy.png", boundary_csv=args.boundary_csv)
+    n_id_plots = plot_id_timeseries(
+        df,
+        diag_dir / "per_id",
+        max_ids=args.max_id_plots,
+        plot_all_ids=args.plot_all_ids,
+        global_params=work_params,
+        args=args,
+    )
+    log_progress("Diagnostics: writing calibration quality plots...", args.verbose)
+    qdf = calibration_quality_frame(samples, work_params, args.temperature)
+    qdf.to_csv(diag_dir / "calibration_quality_samples.csv", index=False)
+    plot_calibration_quality(qdf, diag_dir)
+    plot_parameter_ranges(result, diag_dir)
+    log_progress("Diagnostics: writing identifiability plots...", args.verbose)
+    plot_identifiability_diagnostics(result, diag_dir)
+    log_progress(f"Wrote diagnostics to {diag_dir} ({n_id_plots} per-ID plots)", args.verbose)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Calibrate utility ranges from trajectory data")
+    parser.add_argument("--csv", type=Path, default=REPO_ROOT / "data" / "Final_Lebanon_Data.csv")
+    parser.add_argument("--output", type=Path, default=REPO_ROOT / "Calibration" / "utility_calibration.json")
+    parser.add_argument("--n-samples", type=int, default=2000)
+    parser.add_argument("--n-trials", type=int, default=400)
+    parser.add_argument("--top-fraction", type=float, default=0.1)
+    parser.add_argument("--temperature", type=float, default=0.25)
+    parser.add_argument(
+        "--n-restarts",
+        type=int,
+        default=3,
+        help="Independent random-search restarts (different seeds) aggregated into one near-optimal cloud",
+    )
+    parser.add_argument(
+        "--near-optimal-rel-tol",
+        type=float,
+        default=0.05,
+        help="Relative objective tolerance for the near-optimal set used to build robust_params",
+    )
+    parser.add_argument(
+        "--near-optimal-abs-tol",
+        type=float,
+        default=0.05,
+        help="Absolute objective tolerance for the near-optimal set used to build robust_params",
+    )
+    parser.add_argument(
+        "--closed-loop-windows",
+        type=int,
+        default=40,
+        help="Number of short trajectory windows used in the closed-loop calibration objective",
+    )
+    parser.add_argument(
+        "--closed-loop-horizon-steps",
+        type=int,
+        default=8,
+        help="Number of simulation steps per closed-loop calibration window",
+    )
+    parser.add_argument(
+        "--closed-loop-candidates",
+        type=int,
+        default=80,
+        help="Number of one-step-screened global trials evaluated with closed-loop rollouts",
+    )
+    parser.add_argument(
+        "--closed-loop-weight",
+        type=float,
+        default=1.0,
+        help="Weight on closed-loop rollout tracking error in the calibration objective",
+    )
+    parser.add_argument(
+        "--one-step-weight",
+        type=float,
+        default=0.1,
+        help="Weight on one-step choice NLL regularization in the calibration objective",
+    )
+    parser.add_argument(
+        "--tracking-weight",
+        type=float,
+        default=1.0,
+        help="Weight on normalized mean target rank in the calibration objective",
+    )
+    parser.add_argument(
+        "--tracking-rank-normalizer",
+        type=int,
+        default=63,
+        help="Divide mean target rank by this value before adding to the objective",
+    )
+    parser.add_argument(
+        "--closed-loop-speed-weight",
+        type=float,
+        default=0.5,
+        help="Speed-error weight inside each closed-loop rollout step",
+    )
+    parser.add_argument(
+        "--closed-loop-heading-weight",
+        type=float,
+        default=0.5,
+        help="Heading-error weight inside each closed-loop rollout step",
+    )
+    parser.add_argument("--neighbor-radius", type=float, default=60.0)
+    parser.add_argument("--max-neighbors", type=int, default=6)
+    parser.add_argument("--class-id", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--diagnostics-dir", type=Path, default=REPO_ROOT / "Calibration" / "diagnostics")
+    parser.add_argument(
+        "--boundary-csv",
+        type=Path,
+        default=REPO_ROOT / "data" / "derived_highway_boundaries" / "highway_boundaries.csv",
+        help="Optional highway boundary CSV to overlay on all_agents_xy.png",
+    )
+    parser.add_argument("--no-plots", action="store_true", help="Skip calibration diagnostic plots")
+    parser.add_argument(
+        "--max-id-plots",
+        type=int,
+        default=200,
+        help="Number of per-ID simulated-vs-observed plots unless --plot-all-ids is set",
+    )
+    parser.add_argument(
+        "--per-id-samples",
+        type=int,
+        default=80,
+        help="Maximum observed-choice samples used to calibrate each plotted ID",
+    )
+    parser.add_argument(
+        "--per-id-trials",
+        type=int,
+        default=120,
+        help="Random-search trials for each plotted ID's local calibration",
+    )
+    parser.add_argument(
+        "--per-id-rollout-windows",
+        type=int,
+        default=1,
+        help="Closed-loop trajectory windows used for each plotted ID's local calibration",
+    )
+    parser.add_argument(
+        "--per-id-closed-loop-candidates",
+        type=int,
+        default=20,
+        help="Number of one-step-screened per-ID trials evaluated with closed-loop rollouts",
+    )
+    parser.add_argument(
+        "--plot-all-ids",
+        action="store_true",
+        help="Write one time-series plot for every vehicle ID (thousands of files)",
+    )
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args()
+
+    log_progress(f"Loading trajectory data from {args.csv}...", args.verbose)
+    df = load_and_prepare(args.csv, args.class_id)
+    log_progress(f"Loaded {len(df)} valid trajectory rows.", args.verbose)
+    cfg = EnvConfig()
+    cfg.sim_config["utility_frame"] = "corridor"
+    boundary_map = load_boundary_map(args.boundary_csv)
+    if not boundary_map:
+        print(f"Warning: no run/lane boundaries loaded from {args.boundary_csv}; using nominal-y fallback", flush=True)
+    samples = sample_choices(df, args, cfg.sim_config, boundary_map)
+    if not samples:
+        raise RuntimeError("No calibration samples built from trajectory data")
+    rollout_windows = sample_rollout_windows(
+        df,
+        n_windows=args.closed_loop_windows,
+        horizon_steps=args.closed_loop_horizon_steps,
+        seed=args.seed,
+    )
+    grouped_by_time = {key: group for key, group in df.groupby(["run_id", "time"], sort=False)}
+    log_progress(
+        f"Prepared {len(rollout_windows)} closed-loop windows "
+        f"(horizon={args.closed_loop_horizon_steps} steps each).",
+        args.verbose,
+    )
+
+    result = calibrate(samples, rollout_windows, grouped_by_time, cfg.sim_config, args, boundary_map)
+    log_progress("Global calibration finished.", args.verbose)
+    result["boundary_summary_pca"] = boundary_summary(df)
+    result["candidate_grid"] = {
+        "acceleration": cfg.sim_config["candidate_accel_grid"],
+        "steering": cfg.sim_config["candidate_steering_grid"],
+    }
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    # Keep JSON lean enough: trials are also written to diagnostics CSV.
+    json_result = dict(result)
+    # Embed only a short preview of trials in JSON; full table goes to CSV in diagnostics.
+    if json_result.get("top_trials") and len(json_result["top_trials"]) > 40:
+        json_result["top_trials_preview"] = json_result["top_trials"][:40]
+        json_result["n_top_trials_saved_in_json_preview"] = 40
+        # Keep full trials out of the main JSON to avoid huge files; CSV has all.
+        del json_result["top_trials"]
+    args.output.write_text(json.dumps(json_result, indent=2))
+    # Always write full trial tables next to the JSON even if plots are skipped.
+    trials_dir = args.diagnostics_dir
+    trials_dir.mkdir(parents=True, exist_ok=True)
+    if result.get("top_trials"):
+        pd.DataFrame(result["top_trials"]).to_csv(trials_dir / "top_trials.csv", index=False)
+        near_df = pd.DataFrame([t for t in result["top_trials"] if t.get("near_optimal")])
+        if not near_df.empty:
+            near_df.to_csv(trials_dir / "near_optimal_trials.csv", index=False)
+    if not args.no_plots:
+        write_diagnostics(df, samples, result, args)
+    print(f"Wrote {args.output}", flush=True)
+    print("Best objective:", f"{result['best_objective']:.4f}", flush=True)
+    print("Robust objective:", f"{result['robust_objective']:.4f}", flush=True)
+    print("Best closed-loop loss:", f"{result['best_closed_loop_loss']:.4f}", flush=True)
+    print("Robust closed-loop loss:", f"{result['robust_closed_loop_loss']:.4f}", flush=True)
+    print("Best mean target rank:", f"{result['best_tracking_rank']:.2f}", flush=True)
+    print("Best NLL:", f"{result['best_nll']:.4f}", flush=True)
+    idinfo = result.get("identifiability", {})
+    print(
+        "Identifiability:",
+        f"near-optimal={idinfo.get('n_near_optimal')}/{idinfo.get('n_scored_trials')},",
+        f"obj_range_rel={idinfo.get('near_optimal_objective_range_rel', float('nan')):.4f},",
+        f"verdict={idinfo.get('verdict')}",
+        flush=True,
+    )
+    print("Working params (robust median of near-optimal trials):", flush=True)
+    for key in UTILITY_PARAM_KEYS:
+        print(f"  {key}: {result['working_params'][key]:.4f}", flush=True)
+    print("Best params (single lowest objective):", flush=True)
+    for key in UTILITY_PARAM_KEYS:
+        print(f"  {key}: {result['best_params'][key]:.4f}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

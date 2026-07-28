@@ -151,11 +151,15 @@ class CorridorGeometry:
 
     def project(self, point: np.ndarray) -> tuple[float, float, np.ndarray]:
         point = np.asarray(point, dtype=float)
+        d2 = np.sum((self.center - point) ** 2, axis=1)
+        i0 = int(np.argmin(d2))
+        i_lo = max(0, i0 - 2)
+        i_hi = min(len(self.center) - 2, i0 + 2)
         best_dist = float("inf")
         best_s = 0.0
         best_lateral = 0.0
-        best_tangent = np.array([1.0, 0.0], dtype=float)
-        for i in range(len(self.center) - 1):
+        best_tangent = self.tangents[max(0, min(i0, len(self.tangents) - 1))]
+        for i in range(i_lo, i_hi + 1):
             a = self.center[i]
             b = self.center[i + 1]
             ab = b - a
@@ -330,7 +334,22 @@ def path_adherence_penalty(
     sim_config: dict[str, Any] | None = None,
 ) -> float:
     """Paper Eq. 13."""
-    if sim_config is not None and sim_config.get("path_mode") == "boundary":
+    if sim_config is not None and sim_config.get("path_mode") == "polyline":
+        # Data-derived highway envelope (run_id, lane_kf).
+        try:
+            from RL.corridor import load_corridor
+
+            corridor = load_corridor(
+                int(sim_config["run_id"]),
+                int(sim_config["lane_kf"]),
+            )
+            ell_i = corridor.path_error(
+                candidate_pos,
+                boundary_buffer=float(sim_config.get("boundary_buffer", 1.5)),
+            )
+        except Exception:
+            ell_i = abs(float(candidate_pos[1]) - float(nominal_y))
+    elif sim_config is not None and sim_config.get("path_mode") == "boundary":
         y = float(candidate_pos[1])
         y_min = float(sim_config["road_y_min"])
         y_max = float(sim_config["road_y_max"])

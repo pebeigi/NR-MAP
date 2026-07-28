@@ -1,0 +1,414 @@
+===== PAGE 8 =====
+Fig. 1. Calibration fit diagnostics: empirical CDF and histogram of the observed-like candidate rank, utility margin relative to the best alternative (core
+p10–p99 window), and per-vehicle closed-loop tracking loss.
+c) Identifiability.:Of240closed-loop-scored trials, only
+a small subset lies nearJ(θ ⋆); the near-optimal/top cloud
+still exhibits large coefficient-of-variation across most coor-
+dinates (Fig.??). The strongest tradeoff is betweenS v andγ
+(correlation−0.85), with additional coupling among(S θ, Sv),
+(wx, wc), and(w c, wℓ). Thus the data identify aregionof
+acceptable utility weights more reliably than a unique point
+estimate.
+d) Implications.:For the remainder of this paper we
+(i) fixθ rob as the nominal utility prior, (ii) use the reported
+percentile ranges as bounds for global sensitivity analysis,
+and (iii) interpret residual policy learning as refining behavior
+within an already plausible, but non-unique, utility basin.
+VII. RESULTS
+VIII. CONCLUSION
+IX. LIMITATIONS
+In calibration, although the calibrated utility prior provides a
+usable working point for residual learning, several limitations
+should be noted. First, the ten-dimensional utility parameter
+vector is only weakly identified: multiple substantially dif-
+ferent parameter combinations attain nearly the same closed-
+loop objective, with strong tradeoffs such as that between
+Sv andγ. Consequently, the calibration identifies a region of
+acceptable behavior rather than a unique optimum, which is
+why we report a robust median of near-optimal trials together
+with percentile ranges instead of relying on a single best
+vector. Second, one-step ranking remains imperfect on the
+discrete candidate grid—the observed-like action is frequently
+competitive (median rank near eight; top-ten hit rate about
+63%) but is rarely selected as the unique maximizer—so the
+one-step likelihood alone under-constrains the parameters and
+must be complemented by short-horizon closed-loop tracking.
+Third, per-vehicle local fits exhibit wide dispersion, indicating
+residual heterogeneity that a single population prior cannot
+fully capture. Finally, global sensitivity conclusions are mean-
+ingful only when Sobol ranges are aligned with the calibrated
+uncertainty region; using substantially narrower ad-hoc bounds
+can understate (or misattribute) parameter influence relative to
+the operating regime used downstream.
+===== PAGE 9 =====
+Fig. 2. Global scored-trial distributions of the ten utility parameters (240closed-loop-scored trials from three restarts). Histograms and KDEs are computed
+inside each parameter’s central95%interval; vertical markers indicate the median, best, and robust values when they fall in that window.
+Fig. 3. Per-vehicle local-fit parameter distributions (200trajectories). Histograms and KDEs use the central95%mass for each coordinate.
+REFERENCES
+[1] S. Chandra and U. Kumar, “Capacity estimation procedure for two-
+lane roads under mixed traffic conditions,”Journal of Transportation
+Engineering, vol. 130, no. 5, pp. 737–743, 2004.
+[2] S. I. Khan and P. Maini, “Modeling heterogeneous traffic flow,”Trans-
+portation research record, vol. 1678, no. 1, pp. 234–241, 1999.
+[3] W. Sleiman, M. Haque, M. S. Amin, P. Beigi, M. Khoueiry, S. Kang,
+and S. Hamdar, “Diffusion process-based model for network trajectory
+propagation: Formulation, data mining, and cross-comparative analysis,”
+IEEE Transactions on Intelligent Transportation Systems, 2026.
+[4] S. P. Hoogendoorn and P. H. Bovy, “State-of-the-art of vehicular traffic
+flow modelling,”Proceedings of the Institution of Mechanical Engineers,
+Part I: Journal of Systems and Control Engineering, vol. 215, no. 4, pp.
+283–303, 2001.
+[5] G. Asaithambi and G. Shravani, “Overtaking behaviour of vehicles on
+undivided roads in non-lane based mixed traffic conditions,”Journal of
+traffic and transportation engineering (English edition), vol. 4, no. 3,
+pp. 252–261, 2017.
+===== PAGE 10 =====
+TABLE II
+CALIBRATED UTILITY PARAMETERS:BEST TRIAL,ROBUST MEDIAN OF THE NEAR-OPTIMAL/TOP CLOUD,TOP-CLOUDp 50/p95,AND PER-VEHICLE
+LOCAL-FIT MEDIAN WITH CENTRAL95%INTERVAL.
+Param. Best Robust Topp 50 Topp 95 Per-IDp 50 Per-ID95%CI
+Sθ 3.411 4.216 4.216 8.299 5.297 [0.295,9.728]
+Sv 2.809 3.364 3.364 9.325 3.737 [0.182,9.585]
+ξi 3.000 4.074 4.074 6.791 5.373 [1.227,9.609]
+Sd 4.343 5.802 5.802 7.604 6.393 [0.818,9.890]
+γ1.700 1.453 1.453 4.048 0.854 [0.155,9.009]
+wx 8.297 5.449 5.449 8.257 5.121 [0.322,9.850]
+wy 9.747 3.906 3.906 9.439 6.015 [1.030,9.774]
+wc 97.45 373.9 373.9 807.7 477.8 [23.2,963.7]
+wℓ 54.91 44.16 44.16 84.73 225.3 [2.41,952.5]
+β0.047 1.925 1.925 8.878 4.941 [0.172,9.810]
+[6] I. Bisio, C. Garibotto, H. Haleem, F. Lavagetto, and A. Sciarrone, “A
+systematic review of drone based road traffic monitoring system,”Ieee
+Access, vol. 10, pp. 101 537–101 555, 2022.
+[7] M. Treiber, A. Hennecke, and D. Helbing, “Congested traffic states in
+empirical observations and microscopic simulations,”Physical Review
+E, vol. 62, no. 2, pp. 1805–1824, 2000.
+[8] M. Treiber and A. Kesting,Traffic flow dynamics. Springer, 2013,
+vol. 1.
+[9] M. Bando, K. Hasebe, A. Nakayama, A. Shibata, and Y . Sugiyama,
+“Dynamical model of traffic congestion and numerical simulation,”
+Physical Review E, vol. 51, no. 2, pp. 1035–1042, 1995.
+[10] D. Helbing and P. Moln ´ar, “Social force model for pedestrian dynamics,”
+Physical Review E, vol. 51, no. 5, pp. 4282–4286, 1995.
+[11] M. A. Khan, W. Ectors, T. Bellemans, Y . Ruichek, A.-U.-H. Yasar,
+D. Janssens, and G. Wets, “Unmanned aerial vehicle-based traffic
+analysis: A case study to analyze traffic streams at urban roundabouts,”
+Procedia Computer Science, vol. 130, pp. 636–643, 2018.
+[12] M. Brahimi, S. Karatzas, J. Theuriot, and Z. Christoforou, “Drones for
+traffic flow analysis of urban roundabouts,”International Journal of
+Traffic and Transportation Engineering, vol. 9, no. 3, pp. 62–71, 2020.
+[13] A. Kutsch, M. Margreiter, and K. Bogenberger, “TUMDOT–MUC: Data
+collection and processing of multimodal trajectories collected by aerial
+drones,”Data Science for Transportation, vol. 6, p. 15, 2024.
+[14] E. Puertas, G. De-Las-Heras, J. Fern ´andez-Andr´es, and J. S ´anchez-
+Soriano, “Dataset: Roundabout aerial images for vehicle detection,”
+Data, vol. 7, no. 4, p. 47, 2022.
+[15] A. A. Chaudhari, M. Treiber, and O. Okhrin, “Mitra: A drone-based
+trajectory data for an all-traffic-state inclusive freeway with ramps,”
+Scientific Data, vol. 12, p. 1174, 2025.
+[16] Y .-L. Huang and Y .-H. Chen, “Estimating intersections’ near-crash
+conflicts with the drone-based image-recording data,”Traffic Safety
+Research, 2024.
+[17] M. S. Khoueiry, P. Beigi, and S. H. Hamdar, “Towards universal
+autonomy: Modeling chaotic and non-lane based driving behavior using
+naturalistic trajectories,” 2025, under review.
+===== PAGE 11 =====
+APPENDIXA
+SENSITIVITYANALYSIS
+Understanding parameter sensitivity is crucial to ensure
+that the agent-based model produces reliable, realistic, and
+robust behavior under a wide range of conditions [?], [?].
+The sensitivity analysis reveals how robust the model is to
+parameter variations and helps guide parameter tuning.
+To systematically assess model robustness, we perform both
+local and global sensitivity analyses. Local analysis examines
+the effect of small variations in individual parameters on
+each component of the utility function, providing insight
+into immediate system responsiveness. Global analysis, using
+techniques such as Sobol indices, quantifies the contribution
+of each parameter—including interactions—across their entire
+plausible range. Together, these analyses reveal how sensitive
+the model is to parameter changes and guide informed tuning
+for reliable and realistic agent behavior.
+In this chapter, we focus on the local sensitivity analysis,
+while the global sensitivity analysis will be conducted in a
+later stage of the dissertation.
+APPENDIXB
+LOCALSENSITIVITYANALYSIS
+Local sensitivity analysis quantifies how small parameter
+perturbations affect each component of the utility. We analyze
+the five utility terms from Equation??—directional alignment,
+speed incentive, proximity incentive, collision penalty, and
+path adherence—separately.
+Directional Alignment
+Directional utility rewards candidate motion aligned with
+the local corridor tangent rather than a destination heading.
+Letˆmdenote the unit move direction induced by a candidate
+next position and ˆtthe local corridor unit tangent. Then
+Udir =S θ ( ˆm·ˆt).(30)
+∂Udir
+∂Sθ
+= ˆm·ˆt.(31)
+∂Udir
+∂( ˆm·ˆt) =S θ.(32)
+ThusS θ linearly scales the directional reward. Utility is
+maximized whenˆm· ˆt= 1(perfect corridor alignment)
+and becomes negative when the candidate move opposes the
+corridor orientation. This remains valid for both positive- and
+negative-direction traffic because directionality is defined by
+corridor geometry.
+Speed Incentive
+Speed utility rewards candidate bicycle-rollout speeds close
+to a desired speed. Define the symmetric closeness ratio
+ρ= min(vcand, vdes)
+max(vcand, vdes) ∈(0,1],(33)
+and
+Uspeed =S v
+ρ
+1 +ρ (ξi−1)/2 .(34)
+Fig. 4. Directional utilityU dir versus corridor alignmentˆm·ˆtand directional
+sensitivityS θ.
+The corresponding partial derivatives are
+∂Uspeed
+∂Sv
+= ρ
+1 +ρ (ξi−1)/2 ,(35)
+∂Uspeed
+∂ξi
+=− Sv ρ(ξi+1)/2 lnρ
+2
+ 
+1 +ρ (ξi−1)/22 .(36)
+Utility attains its maximum atv cand =v des (ρ= 1).
+Overspeeding and underspeeding are penalized symmetrically.
+Largerξ i sharpens the drop in utility away from the desired
+speed, making the agent more sensitive to speed mismatch.
+Proximity Incentive
+Proximity utility encourages progress toward a local corri-
+dor reference expressed in Frenet coordinates. The effective
+distance is
+deff =w x|∆s|+w y|∆n|,(37)
+and
+Udist = Sd
+1 + (deff/Hp)γ , H p = max(κvi, Hmin).(38)
+The primary sensitivities are
+∂Udist
+∂Sd
+= 1
+1 + (deff/Hp)γ ,(39)
+∂Udist
+∂γ =−S d
+(deff/Hp)γ ln(deff/Hp)
+ 
+1 + (deff/Hp)γ2 ,(40)
+∂Udist
+∂deff
+=−S d
+γ(deff/Hp)γ
+deff
+ 
+1 + (deff/Hp)γ2 ,(41)
+∂Udist
+∂Hp
+=S d
+γ(deff/Hp)γ
+Hp
+ 
+1 + (deff/Hp)γ2 .(42)
+HereS d scales importance,γcontrols how quickly the reward
+decays outside the horizon,w x andw y weight longitudinal
+versus lateral Frenet error, andH p softens normalized distance
+as speed increases.
+===== PAGE 12 =====
+Fig. 5. Speed utilityU speed versus candidate speedv cand and desired speedv des (withξ i slices).
+Fig. 6. Proximity utilityU dist versus interaction exponentγ, effective Frenet distanced eff, and perception horizonH p.
+Collision-Risk Penalty
+The primary partial derivatives for the collision-risk penalty
+are
+Ucol =w c min(Pi,g,1),(43)
+∂Ucol
+∂wc
+= min(Pi,g,1),(44)
+∂Ucol
+∂Pi,g
+=w c (whenP i,g <1).(45)
+Increasingw c makes the utility more sensitive to predicted
+collision probability and therefore promotes more risk-averse
+behavior.
+For the single-neighbor isotropic Gaussian case, letd=
+∥⃗ rg −⃗ µj∥andΣ j =σ 2I. Then
+Pj,g(d, σ) = 1
+2πσ2 exp
+
+− d2
+2σ2
+
+,(46)
+and the contribution to the penalty is proportional tow cPj,g.
+Smallσcreates a sharp localized risk field, while largerσ
+yields a broader but lower-amplitude risk region. Excessively
+largew c can make agents overly cautious.
+Path Adherence
+The path-adherence term and its derivatives are
+Upath =w ℓ
+ 
+1−e −βℓ2
+i
+
+,(47)
+∂Upath
+∂wℓ
+= 1−e −βℓ2
+i ,(48)
+∂Upath
+∂β =w ℓℓ2
+i e−βℓ2
+i ,(49)
+∂Upath
+∂ℓi
+= 2w ℓβℓie−βℓ2
+i .(50)
+Hereℓ i is a non-negative corridor-boundary residual,w ℓ
+scales the penalty magnitude, andβcontrols how quickly the
+penalty saturates near the boundary. Largerwℓ enforces stricter
+corridor adherence but may conflict with collision avoidance
+or progress when set excessively high.
+APPENDIXC
+GLOBALSENSITIVITYANALYSIS
+Global Sensitivity Analysis (GSA) quantifies how uncer-
+tainty in the model output is attributed to uncertainty in the
+model parameters. Unlike local sensitivity analysis, which
+perturbs one parameter around a nominal value, GSA evaluates
+===== PAGE 13 =====
+Fig. 7. Collision utility contribution versus distance to the predicted neighbor positiond=∥⃗ r g −⃗ µj∥and prediction uncertaintyσ.
+Fig. 8. Path-adherence utilityU path versus path-deviation coefficientβand lateral deviationℓ i.
+the entire parameter space and captures both direct parameter
+effects and higher-order interactions. This analysis identifies
+the most influential utility parameters, guides calibration ef-
+forts, and reveals parameters that have minimal influence on
+the model output.
+The proposed framework represents traffic agents moving
+in continuous two-dimensional space. At each simulation
+step, every agent generates feasible acceleration and steering
+candidates using the kinematic bicycle model and selects the
+candidate that maximizes the utility function defined in Equa-
+tion??. The utility consists of corridor directional preference,
+speed incentive, Frenet-distance proximity incentive, collision-
+risk penalty, and path-adherence penalty.
+The model performance is evaluated using the following
+simulation-level objective:
+Y=
+X
+k∈A
+dfinal
+k +N coll Cpenalty,(51)
+whered final
+k denotes the final Euclidean distance between
+agentkand its destination,N coll is the total number of
+collision events during the simulation, andC penalty is a fixed
+collision penalty. Lower values ofYcorrespond to better
+overall system performance.
+The sensitivity analysis is performed using the variance-
+based Sobol method [?], [?]. Let the model output be
+Y=f(X 1, X2, . . . , XD),
+whereX j represents independent model parameters. The
+output variance is decomposed as
+Var(Y) =
+DX
+j=1
+Vj +
+X
+1≤j<k≤D
+Vjk +···+V 12...D.(52)
+The first-order Sobol index is
+Sj = Vj
+Var(Y) ,(53)
+while the total-order Sobol index is
+STj = 1− VarX∼j
+ 
+EXj [Y|X ∼j]
+
+Var(Y) .(54)
+The first-order index quantifies the direct contribution of
+parameterX j to the output variance, whereas the total-order
+===== PAGE 14 =====
+index measures its overall contribution, including all interac-
+tion effects.
+Sampling is performed using Sobol quasi-random sequences
+generated with theSALiblibrary. A base sample size ofN=
+1024is used for the ten-dimensional parameter space, resulting
+in
+Neval =N(D+ 2) = 1024(10 + 2) = 12288
+simulation evaluations.
+Table III summarizes the parameter ranges considered dur-
+ing the sensitivity analysis.
+TABLE III
+MODEL PARAMETERS AND PREDEFINED RANGES USED IN THESOBOL
+SENSITIVITY ANALYSIS.
+Parameter Description Range
+Sθ Corridor directional weight[0.2,1.0]
+Sv Speed-incentive weight[0.2,1.0]
+ξi Speed-mismatch steepness[1.5,3.5]
+Sd Proximity-incentive weight[0.2,1.0]
+γProximity decay steepness[0.5,3.0]
+wx Longitudinal Frenet weight[0.5,5.0]
+wy Lateral Frenet weight[0.5,5.0]
+wc Collision-risk penalty weight[0.1,20.0]
+wℓ Path-adherence penalty weight[5.0,50.0]
+βPath-adherence saturation rate[0.1,5.0]
+The proximity incentive employs the Frenet effective dis-
+tance
+deff =w x|∆s|+w y|∆n|,(55)
+while the perception horizon is computed as
+Hp = max(κvi, Hmin).(56)
+The speed incentive uses the normalized speed ratio
+ρ= min(vcand, vdes)
+max(vcand, vdes).(57)
+Collision risk follows the probabilistic formulation pre-
+sented in the proposed methodology, where neighboring agents
+are propagated over the candidate time step and collision
+probabilities are accumulated before being weighted byw c.
+A. Sensitivity Analysis Results
+Table IV summarizes the estimated first-order and total-
+order Sobol indices for all utility parameters.
+The sensitivity analysis demonstrates that the speed-
+incentive weightS v is the dominant model parameter, exhibit-
+ing the largest first-order and total-order sensitivity indices.
+The path-adherence saturation parameterβand the corridor
+directional weightS θ are the next most influential parameters,
+followed by the path-adherence penalty weightw ℓ. These four
+parameters account for the majority of the variance in the
+simulation-level performance metric.
+For the dominant parameters, the total-order indices are
+substantially larger than the corresponding first-order indices,
+indicating that their influence arises not only from direct
+TABLE IV
+SOBOL SENSITIVITY INDICES AND ASSOCIATED CONFIDENCE INTERVALS.
+ParameterS 1 S1,conf ST ST,conf
+Sθ 0.128 0.025 0.353 0.029
+Sv 0.287 0.031 0.598 0.041
+ξi -0.001 0.011 0.060 0.012
+Sd 0.005 0.010 0.035 0.006
+γ0.003 0.006 0.021 0.005
+wx 0.033 0.016 0.109 0.013
+wy 0.017 0.011 0.065 0.011
+wc 0.000 0.000 0.000 0.000
+wℓ 0.043 0.022 0.247 0.027
+β0.119 0.033 0.390 0.029
+effects but also through interactions with other utility terms.
+In contrast, the proximity-related parameters (S d,γ,w x, and
+wy) exhibit comparatively small sensitivities, suggesting that
+variations within the investigated ranges have only a limited
+impact on overall model performance.
+The collision-risk penalty weightw c exhibits negligible
+first-order and total-order sensitivity, indicating that this pa-
+rameter has little influence on the objective function for
+the evaluated scenarios. This behavior suggests that collision
+events are either infrequent or effectively avoided across the
+sampled parameter space, resulting in the collision penalty
+contributing minimally to the overall performance metric.
+Overall, the GSA indicates that calibration efforts should
+primarily focus onS v,β,S θ, andw ℓ, while several remaining
+parameters may be assigned nominal values with relatively
+little effect on simulation performance within the investigated
+parameter ranges.

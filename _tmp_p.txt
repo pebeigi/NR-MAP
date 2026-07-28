@@ -1,0 +1,41 @@
+Fig. 1. Calibration fit diagnostics: empirical CDF and histogram of the observed-like candidate rank, utility margin relative to the best alternative (core
+p10–p99 window), and per-vehicle closed-loop tracking loss.
+c) Identifiability.:Of240closed-loop-scored trials, only
+a small subset lies nearJ(θ ⋆); the near-optimal/top cloud
+still exhibits large coefficient-of-variation across most coor-
+dinates (Fig.??). The strongest tradeoff is betweenS v andγ
+(correlation−0.85), with additional coupling among(S θ, Sv),
+(wx, wc), and(w c, wℓ). Thus the data identify aregionof
+acceptable utility weights more reliably than a unique point
+estimate.
+d) Implications.:For the remainder of this paper we
+(i) fixθ rob as the nominal utility prior, (ii) use the reported
+percentile ranges as bounds for global sensitivity analysis,
+and (iii) interpret residual policy learning as refining behavior
+within an already plausible, but non-unique, utility basin.
+VII. RESULTS
+VIII. CONCLUSION
+IX. LIMITATIONS
+In calibration, although the calibrated utility prior provides a
+usable working point for residual learning, several limitations
+should be noted. First, the ten-dimensional utility parameter
+vector is only weakly identified: multiple substantially dif-
+ferent parameter combinations attain nearly the same closed-
+loop objective, with strong tradeoffs such as that between
+Sv andγ. Consequently, the calibration identifies a region of
+acceptable behavior rather than a unique optimum, which is
+why we report a robust median of near-optimal trials together
+with percentile ranges instead of relying on a single best
+vector. Second, one-step ranking remains imperfect on the
+discrete candidate grid—the observed-like action is frequently
+competitive (median rank near eight; top-ten hit rate about
+63%) but is rarely selected as the unique maximizer—so the
+one-step likelihood alone under-constrains the parameters and
+must be complemented by short-horizon closed-loop tracking.
+Third, per-vehicle local fits exhibit wide dispersion, indicating
+residual heterogeneity that a single population prior cannot
+fully capture. Finally, global sensitivity conclusions are mean-
+ingful only when Sobol ranges are aligned with the calibrated
+uncertainty region; using substantially narrower ad-hoc bounds
+can understate (or misattribute) parameter influence relative to
+the operating regime used downstream.
