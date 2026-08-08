@@ -29,6 +29,7 @@ from utility_model import (
     UTILITY_PARAM_KEYS,
     CorridorGeometry,
     TrafficAgent,
+    collision_variances,
     generate_candidate_actions,
 )
 
@@ -44,6 +45,11 @@ PARAM_BOUNDS: dict[str, tuple[float, float]] = {
     "w_c": (0.01, 1000.0),
     "w_ell": (0.1, 1000.0),
     "beta": (0.01, 10.0),
+    "sigma_long": (0.5, 5.0),
+    "sigma_lat": (0.3, 2.5),
+    "beta": (0.01, 10.0),
+    "sigma_long": (0.5, 5.0),
+    "sigma_lat": (0.3, 2.5),
 }
 
 
@@ -501,9 +507,7 @@ def candidate_features_for_state(
     neighbors: list[TrafficAgent],
     sim_config: dict[str, Any],
     run_id: int,
-    lane_kf: int,
-    boundary_map: BoundaryMap,
-    reference_pos: np.ndarray | None = None,
+    params: dict[str, float] | None = None,
 ) -> tuple[list[dict[str, Any]], ChoiceSample]:
     candidates = generate_candidate_actions(agent, sim_config["dt"], sim_config)
     cand_pos = np.vstack([c["pos"] for c in candidates])
@@ -520,6 +524,9 @@ def candidate_features_for_state(
         np.asarray(reference_pos, dtype=float),
         agent.dest,
         corridor,
+    )
+
+    variances = collision_variances(params, sim_config)
     )
 
     variances = np.array(sim_config["collision_pred_variances"], dtype=float)
@@ -567,6 +574,10 @@ def select_best_candidate_with_boundary(
         neighbors,
         sim_config,
         run_id,
+        params=params,
+        lane_kf,
+        boundary_map,
+        reference_pos=reference_pos,
         lane_kf,
         boundary_map,
         reference_pos=reference_pos,

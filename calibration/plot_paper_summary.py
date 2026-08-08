@@ -25,6 +25,8 @@ PARAM_KEYS = (
     "w_c",
     "w_ell",
     "beta",
+    "sigma_long",
+    "sigma_lat",
 )
 
 PARAM_LABELS = {
@@ -38,6 +40,8 @@ PARAM_LABELS = {
     "w_c": r"$w_c$",
     "w_ell": r"$w_\ell$",
     "beta": r"$\beta$",
+    "sigma_long": r"$\sigma_{\parallel}$",
+    "sigma_lat": r"$\sigma_{\perp}$",
 }
 
 PARAM_BOUNDS = {
@@ -51,6 +55,16 @@ PARAM_BOUNDS = {
     "w_c": (0.01, 1000.0),
     "w_ell": (0.1, 1000.0),
     "beta": (0.01, 10.0),
+    "sigma_long": (0.5, 5.0),
+    "sigma_lat": (0.3, 2.5),
+    "w_ell": (0.1, 1000.0),
+    "beta": (0.01, 10.0),
+    "sigma_long": (0.5, 5.0),
+    "sigma_lat": (0.3, 2.5),
+    "w_ell": (0.1, 1000.0),
+    "beta": (0.01, 10.0),
+    "sigma_long": (0.5, 5.0),
+    "sigma_lat": (0.3, 2.5),
 }
 
 

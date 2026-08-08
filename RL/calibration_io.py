@@ -7,12 +7,16 @@ from pathlib import Path
 from typing import Any
 
 from RL._paths import REPO_ROOT
-
+from utility_model import (
+    DEFAULT_KERNEL_PARAMS,
+    DEFAULT_SIGMA_LAT,
+    DEFAULT_SIGMA_LONG,
+)
 
 DEFAULT_CALIBRATION_PATH = REPO_ROOT / "Calibration" / "utility_calibration.json"
 
-# Residual policy modulates these seven terms (Paper Eq. 18).
-# Kept here so the RL package does not depend on mutating utility_model.
+# Residual policy modulates these terms (weights + collision-kernel scales).
+# Kept here so the RL package does not depend on mutating utility_model's clip box.
 RESIDUAL_PARAM_KEYS = (
     "S_v",
     "S_theta",
@@ -21,10 +25,11 @@ RESIDUAL_PARAM_KEYS = (
     "xi_i",
     "gamma",
     "w_ell",
+    "sigma_long",
+    "sigma_lat",
 )
 
 # Absolute ΔΘ bounds large enough to matter at calibrated magnitudes.
-# (utility_model.DEFAULT_RESIDUAL_SCALE=0.25 is negligible for w_c ~ 400.)
 DEFAULT_RESIDUAL_SCALES: dict[str, float] = {
     "S_v": 1.5,
     "S_theta": 1.5,
@@ -33,6 +38,8 @@ DEFAULT_RESIDUAL_SCALES: dict[str, float] = {
     "xi_i": 1.0,
     "gamma": 1.0,
     "w_ell": 15.0,
+    "sigma_long": 1.5,
+    "sigma_lat": 0.6,
 }
 
 # Clip bounds aligned with calibrated / near-optimal ranges (not the old GSA box).
@@ -47,6 +54,8 @@ RL_PARAM_BOUNDS: dict[str, tuple[float, float]] = {
     "w_c": (0.01, 1200.0),
     "w_ell": (0.1, 300.0),
     "beta": (0.01, 12.0),
+    "sigma_long": (0.3, 6.0),
+    "sigma_lat": (0.2, 3.0),
 }
 
 
@@ -62,7 +71,7 @@ def residual_vector_to_dict(residual: Any) -> dict[str, float]:
 def clip_params_rl(params: dict[str, float]) -> dict[str, float]:
     import numpy as np
 
-    out = dict(params)
+    out = {**DEFAULT_KERNEL_PARAMS, **params}
     for key, (lo, hi) in RL_PARAM_BOUNDS.items():
         if key in out:
             out[key] = float(np.clip(out[key], lo, hi))
@@ -74,10 +83,10 @@ def apply_residual(
     delta_theta: dict[str, float] | None,
 ) -> dict[str, float]:
     """Θ_i = Θ_base + ΔΘ_i, then clip with RL-aligned bounds."""
-    merged = dict(base_params)
+    merged = {**DEFAULT_KERNEL_PARAMS, **base_params}
     if delta_theta:
         for key in RESIDUAL_PARAM_KEYS:
-            merged[key] = float(base_params.get(key, 0.0)) + float(delta_theta.get(key, 0.0))
+            merged[key] = float(merged.get(key, 0.0)) + float(delta_theta.get(key, 0.0))
     return clip_params_rl(merged)
 
 
@@ -89,6 +98,8 @@ def load_base_params(
     Load Θ_base from a calibration JSON.
 
     prefer: "robust" (default) | "best"
+
+    Older calibration files without sigma_* get vehicle-scale defaults filled in.
     """
     path = Path(path) if path is not None else DEFAULT_CALIBRATION_PATH
     if not path.exists():
@@ -104,4 +115,7 @@ def load_base_params(
     else:
         params = payload
 
-    return {str(k): float(v) for k, v in params.items()}
+    out = {str(k): float(v) for k, v in params.items()}
+    out.setdefault("sigma_long", DEFAULT_SIGMA_LONG)
+    out.setdefault("sigma_lat", DEFAULT_SIGMA_LAT)
+    return out

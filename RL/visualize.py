@@ -21,7 +21,7 @@ from RL.corridor import (
     load_corridor,
 )
 from RL.traffic_env import EnvConfig, MultiAgentTrafficEnv
-from utility_model import RESIDUAL_PARAM_KEYS
+from RL.calibration_io import RESIDUAL_PARAM_KEYS
 
 try:
     import torch

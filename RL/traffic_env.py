@@ -14,6 +14,7 @@ from RL.corridor import (
     DEFAULT_RUN_ID,
     DEFAULT_VEHICLE_LENGTH,
     DEFAULT_VEHICLE_WIDTH,
+    boundary_reward,
     boxes_overlap,
     corridor_sim_defaults,
     load_corridor,
@@ -43,6 +44,10 @@ class EnvConfig:
     vehicle_length: float = DEFAULT_VEHICLE_LENGTH
     vehicle_width: float = DEFAULT_VEHICLE_WIDTH
     reward_weights: dict[str, float] | None = None
+    # Explicit OBB collision penalty added to the per-step reward of every agent
+    # involved in a collision this step. Soft proximity (r_safety) alone is too
+    # weak for residual learning to care about vehicle-scale overlaps.
+    collision_penalty: float = 0.0
     sim_config: dict[str, Any] | None = None
     base_params: dict[str, float] | None = None
 
@@ -246,7 +251,7 @@ class MultiAgentTrafficEnv:
             r_smooth = -float(np.sum(accel**2))
 
         c_lo, c_hi, _ = self.corridor.clearances(ego.pos)
-        r_boundary = -10.0 if min(c_lo, c_hi) < 0.0 else 0.0
+        r_boundary, _ = boundary_reward(c_lo, c_hi)
         r_traj = 0.0
 
         return (
@@ -305,7 +310,11 @@ class MultiAgentTrafficEnv:
                 )
             self._update_destination_flag(i)
 
-        self._check_collisions()
+        hit = self._check_collisions()
+        if self.config.collision_penalty > 0.0 and hit:
+            penalty = float(self.config.collision_penalty)
+            for i in hit:
+                rewards[i] -= penalty
         self.step_count += 1
 
         observations = [self.get_observation(i) for i in range(len(self.agents))]
@@ -317,6 +326,7 @@ class MultiAgentTrafficEnv:
             "selected_controls": selected_controls,
             "run_id": self.config.run_id,
             "lane_kf": self.config.lane_kf,
+            "colliding_agents": sorted(hit),
         }
         return observations, rewards, done, info
 
@@ -341,12 +351,14 @@ class MultiAgentTrafficEnv:
             agent.vel[:] = 0.0
             agent.prev_control = {"accel": 0.0, "steering": 0.0}
 
-    def _check_collisions(self) -> None:
+    def _check_collisions(self) -> set[int]:
+        """Count pairwise OBB overlaps; return the set of agents involved this step."""
         sim = self.config.sim_config
         length = float(sim.get("vehicle_length", self.config.vehicle_length))
         width = float(sim.get("vehicle_width", self.config.vehicle_width))
         use_obb = bool(sim.get("use_obb_collisions", True))
         threshold = float(sim.get("collision_threshold", 1.5))
+        colliding: set[int] = set()
         for i in range(len(self.agents)):
             for j in range(i + 1, len(self.agents)):
                 if self.agents[i].reached_destination or self.agents[j].reached_destination:
@@ -364,6 +376,8 @@ class MultiAgentTrafficEnv:
                     hit = np.linalg.norm(self.agents[i].pos - self.agents[j].pos) < threshold
                 if hit:
                     self.collision_count += 1
+                    colliding.update((i, j))
+        return colliding
 
     def rollout_metric(self) -> float:
         total_dist = sum(

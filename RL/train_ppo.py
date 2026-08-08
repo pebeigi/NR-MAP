@@ -252,7 +252,12 @@ def make_env(args: argparse.Namespace, seed: int) -> MultiAgentTrafficEnv:
     base_params = None
     if args.calibration is not None:
         base_params = load_base_params(args.calibration, prefer=args.prefer_params)
-    cfg = EnvConfig(max_steps=args.max_steps, num_agents=args.num_agents, base_params=base_params)
+    cfg = EnvConfig(
+        max_steps=args.max_steps,
+        num_agents=args.num_agents,
+        base_params=base_params,
+        collision_penalty=float(getattr(args, "collision_penalty", 0.0)),
+    )
     return MultiAgentTrafficEnv(cfg, seed=seed)
 
 
@@ -282,6 +287,8 @@ def train(args: argparse.Namespace) -> None:
 
     if args.calibration is not None:
         print(f"Using {args.prefer_params} utility params from {args.calibration}")
+    if args.collision_penalty > 0.0:
+        print(f"OBB collision penalty = {args.collision_penalty:.2f} per colliding agent-step")
     base = baseline_metric(args)
     print(f"Utility-only baseline metric over {args.baseline_episodes} episodes: {base:.3f}")
 
@@ -323,6 +330,8 @@ def train(args: argparse.Namespace) -> None:
                 "algo": "ppo",
                 "prefer_params": args.prefer_params,
                 "calibration": str(args.calibration) if args.calibration else None,
+                "collision_penalty": float(args.collision_penalty),
+                "updates": int(args.updates),
             },
             args.save,
         )
@@ -362,6 +371,12 @@ def main() -> None:
         "--save",
         type=Path,
         default=Path("RL/checkpoints/residual_policy.pt"),
+    )
+    parser.add_argument(
+        "--collision-penalty",
+        type=float,
+        default=0.0,
+        help="Per-step reward penalty for each agent involved in an OBB collision",
     )
     args = parser.parse_args()
     if args.calibration is not None and not args.calibration.exists():

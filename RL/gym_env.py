@@ -47,7 +47,8 @@ class TrafficMARLEnv(MultiAgentEnv):
     """
     RLlib-compatible multi-agent environment.
 
-    Each agent outputs a 7D residual vector ΔΘ (Paper Eq. 18). The environment
+    Each agent outputs a residual vector ΔΘ over the modulated utility
+    parameters (weights + collision-kernel scales). The environment
     applies utility maximization and kinematic updates internally.
     """
 

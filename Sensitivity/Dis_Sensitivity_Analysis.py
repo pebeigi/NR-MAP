@@ -317,7 +317,7 @@ def evaluate_simulation_model(parameter_set_list):
         'collision_threshold': 0.5, 
         'kappa_perception_horizon': 2.0, 
         'min_perception_horizon': 5.0,   
-        'collision_pred_variances': [0.25, 0.25], 
+        'collision_pred_variances': [2.25**2, 0.9**2], 
         'max_agent_speed': 10.0, 
         'base_desired_speed': 5.0, 
         'collision_penalty_metric_factor': 10.0,

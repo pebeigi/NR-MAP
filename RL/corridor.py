@@ -25,6 +25,26 @@ DEFAULT_BOUNDARY_CSV = (
 DEFAULT_VEHICLE_LENGTH = 4.5
 DEFAULT_VEHICLE_WIDTH = 1.8
 
+# A flat -10 off-corridor penalty leaves an exploit: the progress earned by
+# cutting across the corridor's curves outweighs it, so leaving the road pays.
+# The base penalty therefore has to exceed the largest per-step progress reward,
+# which is `max_agent_speed` = 16, and the depth term adds an inward gradient.
+# The depth term is capped because an unbounded penalty dominates the return of
+# an untrained policy, which spends most of its early episodes off the corridor,
+# and learning stalls before it ever discovers progress.
+OFFROAD_BASE_PENALTY = 20.0
+OFFROAD_DEPTH_PENALTY = 3.0
+OFFROAD_MAX_DEPTH = 5.0
+
+
+def boundary_reward(clearance_low: float, clearance_high: float) -> tuple[float, bool]:
+    """Off-corridor penalty and whether the vehicle is outside the corridor."""
+    violation = -min(float(clearance_low), float(clearance_high))
+    if violation <= 0.0:
+        return 0.0, False
+    depth = min(violation, OFFROAD_MAX_DEPTH)
+    return -(OFFROAD_BASE_PENALTY + OFFROAD_DEPTH_PENALTY * depth), True
+
 
 @dataclass(frozen=True)
 class HighwayCorridor:

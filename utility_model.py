@@ -9,6 +9,8 @@ from typing import Any
 import numpy as np
 
 # Full utility parameter set used inside the simulator.
+# sigma_long / sigma_lat are the collision-kernel std-devs (m), defaulted to
+# vehicle half-length / half-width so avoidance has support at car scale.
 UTILITY_PARAM_KEYS = (
     "S_theta",
     "S_v",
@@ -20,9 +22,11 @@ UTILITY_PARAM_KEYS = (
     "w_c",
     "w_ell",
     "beta",
+    "sigma_long",
+    "sigma_lat",
 )
 
-# Residual policy modulates these seven terms (Paper Eq. 18).
+# Residual policy modulates these terms (weights + collision-kernel scales).
 RESIDUAL_PARAM_KEYS = (
     "S_v",
     "S_theta",
@@ -31,13 +35,23 @@ RESIDUAL_PARAM_KEYS = (
     "xi_i",
     "gamma",
     "w_ell",
+    "sigma_long",
+    "sigma_lat",
 )
 
 DEFAULT_RESIDUAL_SCALE = 0.25
 
+# Vehicle half-extents used as the default collision-kernel scale (m).
+DEFAULT_SIGMA_LONG = 2.25  # 4.5 m length / 2
+DEFAULT_SIGMA_LAT = 0.9  # 1.8 m width / 2
+DEFAULT_KERNEL_PARAMS = {
+    "sigma_long": DEFAULT_SIGMA_LONG,
+    "sigma_lat": DEFAULT_SIGMA_LAT,
+}
+
 
 def residual_vector_to_dict(residual: np.ndarray) -> dict[str, float]:
-    """Map a 7D residual action vector to named utility-parameter deltas."""
+    """Map a residual action vector to named utility-parameter deltas."""
     arr = np.asarray(residual, dtype=float).reshape(-1)
     if arr.size != len(RESIDUAL_PARAM_KEYS):
         raise ValueError(f"Expected {len(RESIDUAL_PARAM_KEYS)} residuals, got {arr.size}")
@@ -72,6 +86,8 @@ DEFAULT_BASE_PARAMS: dict[str, float] = {
     "w_c": 2.75,
     "w_ell": 2.75,
     "beta": 1.05,
+    "sigma_long": DEFAULT_SIGMA_LONG,
+    "sigma_lat": DEFAULT_SIGMA_LAT,
 }
 
 DEFAULT_SIM_CONFIG: dict[str, Any] = {
@@ -80,7 +96,8 @@ DEFAULT_SIM_CONFIG: dict[str, Any] = {
     "collision_threshold": 0.5,
     "kappa_perception_horizon": 2.0,
     "min_perception_horizon": 5.0,
-    "collision_pred_variances": [0.25, 0.25],
+    # Variances = sigma^2 at vehicle half-extents (fallback if Θ has no sigma_*).
+    "collision_pred_variances": [DEFAULT_SIGMA_LONG**2, DEFAULT_SIGMA_LAT**2],
     "max_agent_speed": 10.0,
     "max_accel": 4.0,
     "perception_radius": 40.0,
@@ -117,19 +134,35 @@ def clip_params(params: dict[str, float]) -> dict[str, float]:
         "w_c": (0.01, 50.0),
         "w_ell": (0.1, 100.0),
         "beta": (0.01, 10.0),
+        "sigma_long": (0.3, 6.0),
+        "sigma_lat": (0.2, 3.0),
     }
-    return {k: float(np.clip(params[k], *bounds[k])) for k in UTILITY_PARAM_KEYS}
+    filled = {**DEFAULT_KERNEL_PARAMS, **params}
+    return {k: float(np.clip(filled[k], *bounds[k])) for k in UTILITY_PARAM_KEYS}
 
 
 def apply_residual(
     base_params: dict[str, float],
     delta_theta: dict[str, float],
 ) -> dict[str, float]:
-    """Θ_i = Θ_base + ΔΘ_i (Paper Eq. 15)."""
-    merged = dict(base_params)
+    """Θ_i = Θ_base + ΔΘ_i."""
+    merged = {**DEFAULT_KERNEL_PARAMS, **base_params}
     for key in RESIDUAL_PARAM_KEYS:
-        merged[key] = base_params[key] + delta_theta.get(key, 0.0)
+        merged[key] = float(merged.get(key, 0.0)) + float(delta_theta.get(key, 0.0))
     return clip_params(merged)
+
+
+def collision_variances(
+    params: dict[str, float] | None,
+    sim_config: dict[str, Any],
+) -> np.ndarray:
+    """Collision-kernel variances (m^2): prefer Θ.sigma_* over sim_config fallback."""
+    if params is not None and "sigma_long" in params and "sigma_lat" in params:
+        return np.array(
+            [float(params["sigma_long"]) ** 2, float(params["sigma_lat"]) ** 2],
+            dtype=float,
+        )
+    return np.asarray(sim_config["collision_pred_variances"], dtype=float)
 
 
 @dataclass(frozen=True)
@@ -309,9 +342,9 @@ def collision_penalty(
     sim_config: dict[str, Any],
     time_to_reach: float,
 ) -> float:
-    """Paper Eqs. 8-12."""
+    """Paper Eqs. 8-12. Kernel width comes from Θ.sigma_* (vehicle-scale by default)."""
     p_sum = 0.0
-    variances = np.array(sim_config["collision_pred_variances"], dtype=float)
+    variances = collision_variances(params, sim_config)
     det_sigma = variances[0] * variances[1]
     pdf_norm = 1.0 / ((2 * np.pi) ** 1 * np.sqrt(det_sigma + 1e-18))
     inv_sigma = np.diag(1.0 / (variances + 1e-9))
