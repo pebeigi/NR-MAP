@@ -252,12 +252,18 @@ def make_env(args: argparse.Namespace, seed: int) -> MultiAgentTrafficEnv:
     base_params = None
     if args.calibration is not None:
         base_params = load_base_params(args.calibration, prefer=args.prefer_params)
-    cfg = EnvConfig(
+    cfg_kwargs = dict(
         max_steps=args.max_steps,
         num_agents=args.num_agents,
         base_params=base_params,
         collision_penalty=float(getattr(args, "collision_penalty", 0.0)),
     )
+    # Optional denser packing so collision-aware residuals see crowded traffic.
+    if getattr(args, "dense_spawn", False):
+        cfg_kwargs["spawn_s_range"] = (20.0, 80.0)
+        cfg_kwargs["spawn_lateral_frac"] = 0.55
+        cfg_kwargs["min_initial_spacing"] = 5.0
+    cfg = EnvConfig(**cfg_kwargs)
     return MultiAgentTrafficEnv(cfg, seed=seed)
 
 
@@ -311,7 +317,8 @@ def train(args: argparse.Namespace) -> None:
 
         mean_metric = float(np.mean(metrics))
         best_metric = min(best_metric, mean_metric)
-        if update == 1 or update % max(args.updates // 10, 1) == 0:
+        log_every = args.log_every if args.log_every > 0 else max(min(args.updates // 10, 10), 1)
+        if update == 1 or update % log_every == 0:
             print(
                 f"Update {update:4d}/{args.updates} | metric={mean_metric:8.3f} | "
                 f"best={best_metric:8.3f} | collisions={np.mean(collisions):5.2f} | "
@@ -377,6 +384,17 @@ def main() -> None:
         type=float,
         default=0.0,
         help="Per-step reward penalty for each agent involved in an OBB collision",
+    )
+    parser.add_argument(
+        "--dense-spawn",
+        action="store_true",
+        help="Pack agents into a shorter spawn window (stress-like training distribution)",
+    )
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=0,
+        help="Print every N updates (0 = auto: min(10, updates/10))",
     )
     args = parser.parse_args()
     if args.calibration is not None and not args.calibration.exists():

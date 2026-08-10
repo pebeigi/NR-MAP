@@ -330,18 +330,37 @@ def collision_probability(
     neighbors: list[TrafficAgent],
     dt: float,
     variances: np.ndarray,
+    heading: float | np.ndarray | None = None,
+    vehicle_length: float = 4.5,
+    vehicle_width: float = 1.8,
 ) -> np.ndarray:
+    """Soft footprint presence matching ``utility_model.collision_penalty``.
+
+    Uses ego-body-frame surface gaps (beyond L×W) so OBB contact has unit
+    presence; anisotropic ``variances`` are σ² along body long/lat axes.
+    """
     if not neighbors:
         return np.zeros(len(cand_pos), dtype=float)
-    det_sigma = variances[0] * variances[1]
-    pdf_norm = 1.0 / ((2 * np.pi) * np.sqrt(det_sigma + 1e-18))
-    inv_sigma = np.diag(1.0 / (variances + 1e-9))
-    p_sum = np.zeros(len(cand_pos), dtype=float)
+    cand_pos = np.asarray(cand_pos, dtype=float)
+    n = len(cand_pos)
+    sig_long = float(np.sqrt(max(float(variances[0]), 1e-12)))
+    sig_lat = float(np.sqrt(max(float(variances[1]), 1e-12)))
+    if heading is None:
+        headings = np.zeros(n, dtype=float)
+    else:
+        headings = np.broadcast_to(np.asarray(heading, dtype=float), (n,))
+    c = np.cos(headings)
+    s = np.sin(headings)
+    p_sum = np.zeros(n, dtype=float)
     for other in neighbors:
-        mu = other.pos + other.vel * dt
+        mu = np.asarray(other.pos, dtype=float) + np.asarray(other.vel, dtype=float) * dt
         diff = cand_pos - mu
-        mahal_sq = np.einsum("ij,jk,ik->i", diff, inv_sigma, diff)
-        p_sum += pdf_norm * np.exp(-0.5 * mahal_sq)
+        d_long = c * diff[:, 0] + s * diff[:, 1]
+        d_lat = -s * diff[:, 0] + c * diff[:, 1]
+        gap_long = np.maximum(0.0, np.abs(d_long) - float(vehicle_length))
+        gap_lat = np.maximum(0.0, np.abs(d_lat) - float(vehicle_width))
+        mahal_sq = (gap_long / sig_long) ** 2 + (gap_lat / sig_lat) ** 2
+        p_sum += np.exp(-0.5 * mahal_sq)
     return np.minimum(p_sum, 1.0)
 
 
@@ -409,7 +428,15 @@ def build_choice_sample(
     )
 
     variances = np.array(sim_config["collision_pred_variances"], dtype=float)
-    p_collision = collision_probability(cand_pos, neighbors, dt, variances)
+    p_collision = collision_probability(
+        cand_pos,
+        neighbors,
+        dt,
+        variances,
+        heading=cand_heading,
+        vehicle_length=float(sim_config.get("vehicle_length", 4.5)),
+        vehicle_width=float(sim_config.get("vehicle_width", 1.8)),
+    )
     path_error = boundary_path_error(
         cand_pos,
         run_id=int(row["run_id"]),
@@ -507,11 +534,15 @@ def candidate_features_for_state(
     neighbors: list[TrafficAgent],
     sim_config: dict[str, Any],
     run_id: int,
+    lane_kf: int,
+    boundary_map: BoundaryMap,
+    reference_pos: np.ndarray | None = None,
     params: dict[str, float] | None = None,
 ) -> tuple[list[dict[str, Any]], ChoiceSample]:
     candidates = generate_candidate_actions(agent, sim_config["dt"], sim_config)
     cand_pos = np.vstack([c["pos"] for c in candidates])
     cand_speed = np.array([float(c["speed"]) for c in candidates], dtype=float)
+    cand_heading = np.array([float(c["heading"]) for c in candidates], dtype=float)
 
     if reference_pos is None:
         reference_pos = agent.utility_reference_pos
@@ -527,10 +558,15 @@ def candidate_features_for_state(
     )
 
     variances = collision_variances(params, sim_config)
+    p_collision = collision_probability(
+        cand_pos,
+        neighbors,
+        float(sim_config["dt"]),
+        variances,
+        heading=cand_heading,
+        vehicle_length=float(sim_config.get("vehicle_length", 4.5)),
+        vehicle_width=float(sim_config.get("vehicle_width", 1.8)),
     )
-
-    variances = np.array(sim_config["collision_pred_variances"], dtype=float)
-    p_collision = collision_probability(cand_pos, neighbors, sim_config["dt"], variances)
     path_error = boundary_path_error(
         cand_pos,
         run_id=run_id,
@@ -574,13 +610,10 @@ def select_best_candidate_with_boundary(
         neighbors,
         sim_config,
         run_id,
+        lane_kf,
+        boundary_map,
+        reference_pos=reference_pos,
         params=params,
-        lane_kf,
-        boundary_map,
-        reference_pos=reference_pos,
-        lane_kf,
-        boundary_map,
-        reference_pos=reference_pos,
     )
     utilities = utility_values(sample, params)
     return candidates[int(np.argmax(utilities))]

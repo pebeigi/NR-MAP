@@ -39,11 +39,20 @@ def _residual_sigma_frozen(**kwargs: Any) -> Controller:
 
 
 def _residual_collpen(**kwargs: Any) -> Controller:
-    """Residual policy trained with an explicit OBB collision penalty."""
+    """Residual trained with an OBB collision penalty (sparse training by default)."""
     from Baselines.residual_marl import ResidualMARLController
 
     kwargs.setdefault("checkpoint", Path("RL/checkpoints/residual_collpen_policy.pt"))
     kwargs.setdefault("name", "residual_collpen")
+    return ResidualMARLController(**kwargs)
+
+
+def _residual_collpen_dense(**kwargs: Any) -> Controller:
+    """Collision-penalty residual trained under dense spawn (stress distribution)."""
+    from Baselines.residual_marl import ResidualMARLController
+
+    kwargs.setdefault("checkpoint", Path("RL/checkpoints/residual_collpen_dense_policy.pt"))
+    kwargs.setdefault("name", "residual_collpen_dense")
     return ResidualMARLController(**kwargs)
 
 
@@ -109,6 +118,7 @@ REGISTRY: dict[str, Callable[..., Controller]] = {
     "residual_marl": _residual_marl,
     "residual_sigma_frozen": _residual_sigma_frozen,
     "residual_collpen": _residual_collpen,
+    "residual_collpen_dense": _residual_collpen_dense,
     "orca": _orca,
     "social_force": _social_force,
     "dwa": _dwa,
@@ -141,7 +151,8 @@ LABELS = {
     "utility_pt_logit": "Utility prior (logit choice)",
     "residual_marl": "Residual MARL (ours)",
     "residual_sigma_frozen": "Residual (sigma frozen)",
-    "residual_collpen": "Residual + collision penalty",
+    "residual_collpen": "Residual + coll. penalty",
+    "residual_collpen_dense": "Residual + coll. pen. (dense)",
     "orca": "ORCA",
     "social_force": "Social force (SDP)",
     "dwa": "DWA",
@@ -174,10 +185,8 @@ def controller_kwargs(
         if residual_checkpoint is not None:
             kwargs["checkpoint"] = residual_checkpoint
         return kwargs
-    if name == "residual_collpen":
+    if name in {"residual_collpen", "residual_collpen_dense"}:
         kwargs = {"calibration": calibration}
-        # Prefer an explicitly provided residual checkpoint only when it looks like
-        # the collision-penalty run; otherwise use the dedicated default path.
         if residual_checkpoint is not None and "collpen" in residual_checkpoint.name:
             kwargs["checkpoint"] = residual_checkpoint
         return kwargs

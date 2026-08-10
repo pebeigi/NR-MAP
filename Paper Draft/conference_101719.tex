@@ -1,0 +1,1006 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{appendix}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+\begin{document}
+
+\title{Decentralized Spatial Negotiation via Residual Utility Learning: Residual Multi-Agent Policies over Behavioral Priors, utility-guided residual multi-agent reinforcement learning framework for trajectory generation}
+
+\author{\IEEEauthorblockN{Pedram Beigi}
+\IEEEauthorblockA{\textit{The George Washington University}\\
+Washington, DC, USA}
+\and
+\IEEEauthorblockN{Samer Hamdar}
+\IEEEauthorblockA{\textit{The George Washington University}\\
+Washington, DC, USA}
+}
+
+\maketitle
+
+\begin{abstract}
+
+Traffic in many developing regions operates under weak lane discipline, heterogeneous vehicle interactions, and decentralized negotiation of shared space. These environments challenge conventional lane-based trajectory prediction and motion planning frameworks, which typically rely on structured map priors and predefined leader--follower relationships. This paper presents a utility-guided residual multi-agent reinforcement learning framework for motion modeling in weakly structured non-lane-based traffic.
+
+The proposed approach combines an interpretable utility-based behavioral model with a residual multi-agent reinforcement learning policy. The utility model encodes directional preference, speed incentive, collision risk, and proximity-aware interaction terms derived from behavioral and economic decision-making principles. Rather than learning motion policies from scratch, the reinforcement learning layer adaptively modulates the utility-driven behavior through residual policy learning, enabling emergent negotiation and interaction behaviors while preserving physical interpretability and safety consistency.
+
+The framework is evaluated on a weak-lane multilane freeway corridor reconstructed from high-resolution aerial trajectories collected in Lebanon. The proposed residual policy is benchmarked against classical continuous-space planners (ORCA, social force, DWA, MPPI), a calibrated utility prior, and a pure multi-agent RL baseline (MAPPO) under a shared simulation harness. Results show that residual learning improves the calibrated prior---especially under dense stress---while retaining human-like speed and acceleration statistics that pure RL tends to sacrifice for arrival efficiency.
+
+This work establishes a principled framework for integrating behavioral utility theory and multi-agent reinforcement learning for decentralized motion generation in weakly structured traffic environments.
+
+\end{abstract}
+
+\begin{IEEEkeywords}
+Motion Modeling, Reinforcement Learning, Multi-Agent Systems, Decision-Making Under Uncertainty, Trajectory Data, Model Calibration
+\end{IEEEkeywords}
+
+\section{Introduction}
+\label{introduction}
+
+In many developing countries, transportation systems operate under conditions that differ substantially from the structured, lane-disciplined traffic typically assumed in classical models \cite{chandra2004mixedtraffic, arasan2010heterogeneous, sleiman2026diffusion}. Weak rule enforcement, heterogeneous vehicle fleets, and informal negotiation of right-of-way produce complex interactions that challenge traditional traffic flow theory \cite{hoogendoorn2001state}. Such irregular behaviors including lateral encroachments, opportunistic yielding, and abrupt accelerations are prevalent in Lebanon, where infrastructure and enforcement limitations contribute to weak-lane and non-standard driving patterns \cite{xu2018nonlane}. Accurately representing these settings requires empirical data and modeling approaches that remain valid when lane structure and deterministic leader-follower assumptions are only weakly satisfied.
+
+Recent advances in aerial data collection enable direct observation of naturalistic traffic with high spatial and temporal resolution. Drone-based video provides an unobstructed top-down view of vehicle motion, allowing large-scale extraction of trajectories while preserving behavioral authenticity \cite{zhou2017trajectorydrone}. This study focuses on an aerial trajectory dataset collected in Jounieh, Lebanon, over a multilane freeway segment characterized by non-lane-based longitudinal interactions and informal lateral negotiation. Roundabout geometries with opportunistic merging remain an important future evaluation setting, but all residual-learning and benchmarking experiments reported here are confined to the freeway corridor so that claims match the calibrated prior and closed-loop harness.
+
+Microscopic vehicle models and modern trajectory forecasting frameworks remain central to representing vehicle interactions. However, state-of-the-art deep learning architectures (e.g., LaneGCN, VectorNet, Wayformer) predominantly assume strict lane centerlines, predefined map topologies, and structured drivable spaces. Consequently, they struggle to capture decentralized negotiation, emergent lane formation, and interaction-only forecasting without map priors in weak-lane environments. Furthermore, while Multi-Agent Reinforcement Learning (MARL) offers a pathway to game-theoretic trajectory generation, standard MARL formulations frequently fail in traffic applications. These failures stem from enormous action spaces, sparse rewards, collision instability, and a lack of human behavioral priors, ultimately yielding physically unrealistic driving behavior.
+
+To bridge this gap, we introduce a utility-guided residual MARL architecture specifically designed for unstructured, non-lane-based traffic. By decoupling human behavioral priors from deep policy learning, the proposed framework avoids the pitfalls of blind reinforcement learning. The architecture operates through a four-stage process:
+
+\begin{itemize}
+    \item \textbf{Stage 1: Utility Prior:} An interpretable baseline utility formulation ($U_{base}$) captures directional preference, collision risk, and speed incentive to generate candidate trajectories and nominal actions based on established behavioral theories (e.g., Prospect Theory).
+    \item \textbf{Stage 2: Local Neighborhood Encoding:} Each agent observes a fixed budget of nearest neighbors (relative position and velocity) together with corridor clearances, yielding a fully decentralized observation.
+    \item \textbf{Stage 3: RL Residual:} Instead of learning raw control actions, a shared residual policy learns a parameter adjustment $\Delta\Theta(o_{i})$ that modulates the underlying utility weights and collision-kernel scales.
+    \item \textbf{Stage 4: Final Utility Maximization:} The executed action is obtained by discrete utility maximization under $\Theta_{i}=\mathrm{clip}(\Theta_{\mathrm{base}}+\Delta\Theta_{i})$, preserving physical realism, interpretability, and kinematic feasibility while enabling context-dependent negotiation.
+\end{itemize}
+
+Beyond reproducing vehicle kinematics, weak-lane and chaotic driving reflect asymmetric human decision-making under perceived risk. Prospect theory provides a principled framework to quantify such behaviors relative to reference points, highlighting how drivers trade off progress against conflict risk. The proposed residual MARL framework complements this by providing a data-driven mechanism to capture implicit interaction rules and spatial negotiation across multiple agents in dense settings.
+
+The contributions of this study are:
+\begin{itemize}
+    \item Calibration of a twelve-parameter utility prior (including vehicle-scale collision-kernel widths) on Lebanon freeway aerial trajectories, with robust working parameters for downstream simulation.
+    \item A utility-guided residual MARL policy that learns nine-dimensional parameter adjustments $\Delta\Theta$ (including $\Delta\sigma_{\parallel},\Delta\sigma_{\perp}$) rather than raw controls, preserving interpretability under bicycle kinematics.
+    \item A matched-seed closed-loop benchmark on the freeway corridor comparing residual MARL to ORCA, social force, DWA, MPPI, MAPPO, and the frozen utility prior, with ablations and a dense stress protocol.
+    \item Evidence that residual adaptation improves prior safety under density and retains realism relative to pure MARL, while classical planners remain strongest on sparse collision counts.
+\end{itemize}
+
+This integrated approach establishes a robust foundation for modeling heterogeneous, non-lane-based traffic using a principled combination of deterministic, stochastic, and learning-based methods.
+
+\section{Literature Review}
+\label{lit_review}
+
+Modeling vehicle motion in traffic systems has been a central topic in transportation research, with a wide range of approaches developed to describe how drivers interact with their surroundings. Traditional models largely rely on structured, lane-based assumptions, while more recent work has explored interaction-driven, behavioral, and learning-based frameworks to better capture complex and unstructured traffic environments. This section reviews the relevant literature across four key domains: classical microscopic models, non-lane-based traffic modeling, interaction-based motion models, and data-driven learning approaches.
+
+\subsection{Classical Microscopic Traffic Models}
+Microscopic traffic flow models describe the behavior of individual vehicles, typically focusing on how drivers adjust acceleration in response to surrounding traffic conditions. Among the most widely used formulations are car-following models such as the Intelligent Driver Model (IDM) \cite{treiber2000congested, treiber2013traffic}, the Full Velocity Difference Model (FVDM) \cite{bando1995dynamical}, and Gipps’ model. These models assume a well-defined leader--follower relationship and describe vehicle acceleration as a function of spacing, relative speed, and desired velocity.
+
+Such formulations have been successful in modeling traffic dynamics on structured highways with strong lane discipline. Their parameters are often interpretable, capturing driver preferences for desired speed, time headway, and acceleration behavior. However, their reliance on a single leading vehicle and strictly longitudinal interactions limits their applicability in environments where lane structure is weak or absent. In such cases, interactions become inherently two-dimensional, and drivers may respond simultaneously to multiple neighboring vehicles rather than a single leader.
+
+\subsection{Non-Lane-Based and Heterogeneous Traffic}
+In many developing regions, traffic is characterized by weak lane discipline, heterogeneous vehicle types, and informal negotiation of space. These conditions give rise to non-lane-based traffic, where vehicles do not adhere to fixed lanes and instead move in a continuous two-dimensional space. Several studies have highlighted the limitations of classical car-following models in such environments and proposed adaptations to account for lateral interactions and multiple leaders.
+
+Research on heterogeneous traffic flow emphasizes the importance of capturing interactions beyond a single leader, including lateral encroachments and opportunistic maneuvers. Approaches often rely on data-driven definitions of interaction neighborhoods or extend classical models to consider multiple surrounding vehicles. Despite these efforts, many models retain a fundamentally longitudinal structure and struggle to fully represent the decentralized and multi-agent nature of non-lane-based traffic. This has motivated the exploration of alternative modeling paradigms that operate directly in continuous space.
+
+\subsection{Interaction-Based and Continuous-Space Models}
+To address the limitations of lane-based formulations, a class of models has emerged that represents vehicle motion through local interactions in continuous space. One prominent example is the Social Force Model (SFM) \cite{helbing1995socialforce}, originally developed for pedestrian dynamics. In this framework, agents are subject to attractive forces toward desired motion and repulsive forces from nearby agents, enabling flexible modeling of dense and unstructured interactions.
+
+In robotics and multi-agent systems, collision avoidance has been extensively studied using velocity-based approaches such as Velocity Obstacles (VO) and Reciprocal Velocity Obstacles (RVO). Building on these concepts, the Optimal Reciprocal Collision Avoidance (ORCA) framework \cite{berg2008reciprocal, berg2011reciprocal} formulates collision avoidance as a set of linear constraints in velocity space. Each agent computes a feasible set of collision-free velocities by considering pairwise interactions with neighboring agents and selects the velocity closest to its preferred motion.
+
+These approaches are well-suited for modeling multi-agent interactions in continuous space and can scale to dense environments without requiring explicit lane definitions. However, they are primarily geometric and deterministic in nature, focusing on collision avoidance rather than behavioral realism. As a result, they do not explicitly capture driver heterogeneity, risk perception, or decision-making under uncertainty, which are critical components of real-world driving behavior.
+
+\subsection{Behavioral and Stochastic Models}
+Human driving behavior is inherently stochastic and influenced by subjective perceptions of risk and reward. Behavioral models aim to capture these aspects by incorporating psychological and decision-theoretic principles into motion modeling. Prospect Theory \cite{kahneman1979prospect} provides a well-established framework for modeling decision-making under risk, where outcomes are evaluated relative to a reference point and losses are weighted more heavily than gains.
+
+In transportation research, prospect-theoretic formulations have been applied to problems such as route choice and gap acceptance, demonstrating the importance of asymmetric risk perception in driving decisions. These models provide a natural way to represent aggressive or conservative behavior, particularly in environments where drivers must continuously evaluate trade-offs between progress and safety.
+
+Despite their strengths, most behavioral models are not formulated in a fully continuous two-dimensional setting and often rely on simplified interaction assumptions. Integrating behavioral decision-making with realistic multi-agent interactions remains an open challenge, particularly in non-lane-based traffic environments.
+
+\subsection{Learning-Based and Multi-Agent Approaches}
+Recent advances in machine learning have led to the development of data-driven approaches for modeling vehicle behavior, particularly through reinforcement learning. In this paradigm, agents learn control policies by interacting with an environment and optimizing a reward function that encodes desired objectives such as safety, efficiency, and comfort.
+
+Multi-Agent Reinforcement Learning (MARL) extends this framework to settings where multiple agents interact simultaneously. The Multi-Agent Deep Deterministic Policy Gradient (MADDPG) algorithm \cite{lowe2017multi} is a widely used approach for continuous control problems, enabling agents to learn decentralized policies while leveraging centralized training. Such methods have been applied to autonomous driving scenarios, demonstrating the ability to capture complex interaction patterns and emergent behaviors.
+
+Learning-based approaches offer significant flexibility and can adapt to complex, high-dimensional environments without requiring explicit modeling assumptions. However, they often lack interpretability and depend heavily on the design of reward functions and training data. Moreover, their behavior may be difficult to analyze or generalize beyond the training conditions.
+
+\subsection{Research Gap and Contribution}
+The existing literature provides a diverse set of tools for modeling traffic dynamics, ranging from deterministic interaction-based models to stochastic behavioral formulations and data-driven learning approaches. However, these paradigms are typically studied in isolation, and direct comparisons across fundamentally different modeling assumptions remain limited.
+
+In particular, there is a lack of unified frameworks that evaluate deterministic collision-avoidance models, stochastic decision-theoretic models, and multi-agent learning approaches within the same non-lane-based traffic context. This gap is especially relevant for heterogeneous traffic environments, where interactions are multi-dimensional and behavior is highly variable.
+
+To address this limitation, the present study develops a comparative freeway evaluation that places a prospect-theoretic utility prior and a residual MARL adapter alongside classical continuous-space planners (ORCA, social force, DWA, MPPI) and a pure MARL baseline (MAPPO) in a shared closed-loop harness. This design isolates the value of residual utility adaptation relative to both geometric planners and learning without behavioral priors.
+
+\subsection{Trajectory Data}
+The rapid growth of aerial data collection has transformed how chaotic and non-lane-based traffic patterns are observed and modeled. Unmanned aerial vehicles (UAVs) provide a top-down view that can simultaneously capture trajectories of all road users, including vehicles, cyclists, and pedestrians, over complex geometries. A UAV-based methodological framework was developed for multivehicle trajectory extraction at urban roundabouts, demonstrating that drones can capture detailed kinematic profiles and gap-acceptance behavior that are difficult to observe using fixed cameras \cite{khan2018uav}. Other researchers used drones to analyze traffic flow at urban roundabouts, showing how high-resolution aerial imagery can reveal subtle lane encroachments, yielding patterns, and circulation strategies that are often invisible in aggregated loop-detector data \cite{brahimi2020drones}.
+
+In parallel, several open datasets have emerged that provide high-fidelity trajectories from aerial views for intersections and roundabouts. Researchers introduced the TUMDOT-MUC dataset, a large-scale collection of multimodal trajectories (motorized vehicles and vulnerable road users) gathered by drone over multiple urban sites, specifically designed to support model calibration and safety analysis in complex multimodal environments \cite{kutsch2024tumdot}. Other researchers published a dataset of UAV-based aerial images with detailed vehicle annotations, enabling researchers to build and validate computer-vision pipelines for vehicle detection and, by extension, trajectory extraction in circular intersections \cite{puertas2022roundabout}. More recently, the MiTra dataset was released, which provides drone-based trajectories for freeways with ramps across all traffic states, illustrating how persistent aerial observation can be used to study microscopic behavior from free flow to congestion \cite{chaudhari2025mitra}.
+
+Aerial data has also been leveraged for proactive safety analysis. The Extra Brake Required to Avoid a Crash (EBRAC) surrogate measure was proposed using drone-based image-recording data, quantifying near-crash conflicts at intersections by reconstructing detailed braking profiles and interaction dynamics \cite{huang2024ebrac}. This work illustrates how high-resolution trajectories can be transformed into interpretable safety indicators that directly reflect road-user maneuvers. Similar methodologies have been applied to other drone-based datasets to derive conflict-based safety metrics and evaluate how geometric design and control strategies affect risk.
+
+\subsection{Research Gap}
+Overall, the literature shows (i) strong evidence that weak lane discipline and heterogeneous traffic can lead to highly irregular, “chaotic” driving patterns; (ii) a growing family of non-lane-based car-following and agent-based models tailored to disordered streams; and (iii) an expanding ecosystem of aerial trajectory datasets that enable detailed observation of such behavior. However, gaps remain in how these methods are applied across different geometric contexts.
+
+For freeway environments in developing countries, only limited work has calibrated microscopic models to non-lane-based longitudinal behavior, where drivers frequently deviate from lane centers, negotiate lateral space informally, and adopt highly variable spacing at moderate to high speeds. Existing studies rarely evaluate how classical lane-based models such as IDM perform relative to non-lane-based formulations when exposed to such freeway conditions.
+
+Similarly, for small, nominally single-lane roundabouts, prior research rarely calibrates or compares models using high-frequency trajectories that capture the lane-free circulation, opportunistic merging, and lateral encroachment characteristic of these sites. In particular, there is little evidence on whether IDM can adapt to these chaotic interaction patterns or whether non-lane-based models (e.g., FVDM, two-sided gap models, SFM) offer clear advantages.
+
+The present study addresses these gaps by (i) extracting detailed vehicle trajectories from aerial video at a freeway site in Lebanon, (ii) calibrating lane-based (IDM) and non-lane-based models (FVDM and SFM) to these contrasting environments, and (iii) systematically comparing their ability to reproduce the observed acceleration, spacing, and maneuvering patterns. This dual-context evaluation enables a unified assessment of model robustness across two representative forms of non-lane-based driving: high-speed freeway flow and \textcolor{red}{chaotic roundabout circulation}.
+
+\section{METHODOLOGY}
+This work proposes a utility-guided residual multi-agent reinforcement learning framework for motion generation in weakly structured non-lane-based traffic. Unlike conventional lane-based trajectory prediction approaches that rely on explicit lane markings, discrete lane topology, or predefined leader-follower relationships, the proposed framework models vehicle interactions directly in continuous two-dimensional space through decentralized utility maximization and adaptive behavioral learning.
+
+Although lane markings are not imposed as discrete behavioral modes, agents remain constrained by the physical geometry of the drivable corridor. Corridor-aligned Frenet features and boundary penalties are therefore used to encode physical road geometry without reducing behavior to classical lane keeping.
+
+The proposed framework combines two complementary components:
+\begin{enumerate}
+    \item an interpretable utility-based behavioral prior that captures directional preference, collision risk, speed regulation, proximity/progress incentive, and corridor adherence;
+    \item a residual multi-agent reinforcement learning policy that adaptively modulates selected utility parameters according to the surrounding traffic context.
+\end{enumerate}
+
+Rather than directly learning low-level control actions or trajectories from scratch, the reinforcement learning layer learns residual behavioral adaptations over a structured utility formulation. This preserves physical interpretability and kinematic feasibility while enabling emergent negotiation behaviors in dense heterogeneous traffic.
+
+\subsection{Problem Formulation}
+Traffic is modeled as a decentralized multi-agent system operating in continuous two-dimensional space. Let $\mathcal{A}=\{1,2,\ldots,N\}$ denote the set of traffic agents. Each agent $i\in\mathcal{A}$ is represented by a continuous kinematic state
+\begin{equation}
+s_{i}^{t}=\big[x_{i}^{t},y_{i}^{t},v_{i}^{t},\theta_{i}^{t}\big],
+\end{equation}
+where $(x_{i}^{t},y_{i}^{t})$ denotes spatial position, $v_{i}^{t}\ge 0$ denotes speed magnitude, and $\theta_{i}^{t}$ denotes heading angle.
+
+Each agent observes a local neighborhood of at most $K$ nearest neighbors within a perception radius $R_{p}$:
+\begin{equation}
+\mathcal{N}_{i}^{t}
+=
+\Big\{
+j\in\mathcal{A}\setminus\{i\}
+\;\Big|\;
+\|r_{j}^{t}-r_{i}^{t}\|_{2}\le R_{p}
+\Big\}_{1:K},
+\end{equation}
+where $r_{i}^{t}=(x_{i}^{t},y_{i}^{t})$ and the subset retains the $K$ closest neighbors by Euclidean distance.
+
+The objective of each agent is to generate feasible motion that progresses along the corridor, avoids collisions, remains within drivable boundaries, and negotiates shared space with neighboring agents. Unlike classical lane-based formulations, agents are not restricted to discrete lane IDs or fixed leader-follower roles.
+
+\subsection{Utility-Based Behavioral Prior}
+The nominal motion behavior of each agent is governed by a utility-maximization process over a discrete control-candidate set. At each time step, agent $i$ evaluates candidates generated from a finite grid of longitudinal acceleration and steering values,
+\begin{equation}
+\mathcal{G}
+=
+\big\{(a,\delta)\big\}
+=
+\mathcal{A}_{\text{acc}}\times\mathcal{A}_{\text{steer}},
+\end{equation}
+and selects the candidate that maximizes expected utility after one-step kinematic bicycle rollout:
+\begin{equation}
+(a_{i}^{*},\delta_{i}^{*})
+=
+\arg\max_{(a,\delta)\in\mathcal{G}}
+U_{i}\!\left(s_{i}'(a,\delta);\Theta_{i}\right),
+\end{equation}
+where $s_{i}'(a,\delta)$ is the predicted next state obtained from the bicycle dynamics and $\Theta_{i}$ denotes the agent's behavioral utility parameters.
+
+The total utility consists of five components:
+\begin{equation}
+U_{i}
+=
+U_{\mathrm{dir}}
++
+U_{\mathrm{speed}}
++
+U_{\mathrm{dist}}
+-
+U_{\mathrm{col}}
+-
+U_{\mathrm{path}}.
+\end{equation}
+
+\subsubsection{Directional Utility}
+Directional utility encourages motion aligned with the local corridor tangent rather than an unconstrained destination vector. Let
+\begin{equation}
+\hat{m}_{i}
+=
+\frac{r_{i}'-r_{i}}{\|r_{i}'-r_{i}\|_{2}}
+\end{equation}
+denote the unit move direction induced by a candidate next position $r_{i}'$, and let $\hat{t}_{i}$ denote the unit tangent of the corridor centerline at the ego agent's current projection. Then
+\begin{equation}
+U_{\mathrm{dir}}
+=
+S_{\theta}\,
+\hat{m}_{i}^{\top}\hat{t}_{i},
+\end{equation}
+where $S_{\theta}>0$ controls directional sensitivity. This formulation remains valid for both positive- and negative-direction traffic because directionality is defined by the corridor orientation rather than the global $x$-axis.
+
+\subsubsection{Speed Incentive}
+Speed incentive rewards candidate rollout speeds that are close to a desired speed $v_{\mathrm{des},i}$. Because scalar speed is non-negative, reverse motion is represented through heading rather than negative speed. For a candidate speed $v_{i}'$, define the symmetric closeness ratio
+\begin{equation}
+\rho_{i}
+=
+\frac{\min(v_{i}',v_{\mathrm{des},i})}{\max(v_{i}',v_{\mathrm{des},i})}\in(0,1].
+\end{equation}
+The speed utility is then
+\begin{equation}
+U_{\mathrm{speed}}
+=
+S_{v}\,
+\frac{\rho_{i}}{1+\rho_{i}^{(\xi_{i}-1)/2}},
+\end{equation}
+where $S_{v}>0$ scales the term and $\xi_{i}>1$ controls how sharply the reward decreases under speed mismatch. The maximum occurs at $v_{i}'=v_{\mathrm{des},i}$, and overspeeding and underspeeding are penalized symmetrically.
+
+\subsubsection{Proximity Incentive}
+Proximity utility encourages progress toward a local reference point expressed in corridor Frenet coordinates. Let $(s_{i}',n_{i}')$ be the longitudinal and lateral projections of the candidate next position onto the corridor, and let $(s_{\mathrm{ref}},n_{\mathrm{ref}})$ be the corresponding projection of a local reference location (e.g., a short-horizon target state). The anisotropic effective distance is
+\begin{equation}
+d_{\mathrm{eff}}
+=
+w_{x}|s_{i}'-s_{\mathrm{ref}}|
++
+w_{y}|n_{i}'-n_{\mathrm{ref}}|.
+\end{equation}
+A speed-dependent perception horizon,
+\begin{equation}
+H_{p}
+=
+\max\!\left(\kappa v_{i},\, H_{\min}\right),
+\end{equation}
+normalizes this distance, yielding
+\begin{equation}
+U_{\mathrm{dist}}
+=
+\frac{S_{d}}{1+(d_{\mathrm{eff}}/H_{p})^{\gamma}},
+\end{equation}
+where $S_{d}>0$ caps the reward magnitude and $\gamma>0$ controls how quickly the incentive decays for distant candidates.
+
+\subsubsection{Collision-Risk Utility}
+In weakly structured environments, collision risk cannot be reduced to hard geometric overlaps alone. Instead, collision risk is modeled by comparing the candidate next pose of the ego agent with short-horizon predictions of neighbors, expressed in the ego body frame and measured relative to vehicle footprints (length $L$, width $W$; defaults $4.5\,\mathrm{m}\times 1.8\,\mathrm{m}$).
+
+For neighbor $j$, the predicted future position after the candidate arrival time $\Delta t$ is obtained by constant-velocity extrapolation,
+\begin{equation}
+\mu_{j}
+=
+r_{j}+v_{j}\Delta t.
+\end{equation}
+Let $\Delta r_{i'j}=R(\psi_{i'})^{\top}(r_{i}'-\mu_{j})$ be this relative vector in the candidate heading frame ($+x$ forward). Surface gaps beyond the same-size footprints are
+\begin{equation}
+g_{\parallel}=\max\!\bigl(0,\,|\Delta r_{i'j}^{(x)}|-L\bigr),\qquad
+g_{\perp}=\max\!\bigl(0,\,|\Delta r_{i'j}^{(y)}|-W\bigr),
+\end{equation}
+so overlapping oriented boxes yield zero gap. Soft presence uses an anisotropic Gaussian on these gaps,
+\begin{equation}
+P_{j,i'}
+=
+\exp\!\left(
+-\frac{1}{2}
+\left[
+\left(\frac{g_{\parallel}}{\sigma_{\parallel}}\right)^{2}
++
+\left(\frac{g_{\perp}}{\sigma_{\perp}}\right)^{2}
+\right]
+\right),
+\end{equation}
+with calibrated (and residual-adapted) scales $\sigma_{\parallel},\sigma_{\perp}$. Aggregating over neighbors and capping cumulative risk yields
+\begin{equation}
+U_{\mathrm{col}}
+=
+w_{c}\,
+\min\!\left(
+\sum_{j\in\mathcal{N}_{i}}
+P_{j,i'}
+,\,1
+\right),
+\end{equation}
+where $w_{c}>0$ controls collision aversion. Candidate selection additionally rejects bicycle rollouts whose predicted OBB overlaps a neighbor when a collision-free alternative exists, and speed alignment uses the nearest ahead neighbor as a car-following reference when one is present. In the implemented simulator, $\Delta t$ corresponds to the discrete control interval used by the bicycle rollout.
+%
+\subsubsection{Path Adherence and Boundary Constraints}
+Although agents negotiate laterally inside the corridor without discrete lane constraints, they remain subject to infrastructural boundaries. A path-adherence penalty discourages proximity to corridor edges and off-road intrusion:
+\begin{equation}
+U_{\mathrm{path}}
+=
+w_{\ell}\big(1-e^{-\beta\,\ell_{i}^{2}}\big),
+\end{equation}
+where $\ell_{i}$ is a non-negative lateral clearance residual relative to the corridor boundary (including an optional near-edge buffer), $w_{\ell}$ scales the penalty magnitude, and $\beta$ controls the sharpness of the transition near the boundary.
+
+\subsection{Kinematic Bicycle Candidate Generation}
+Each control candidate $(a,\delta)$ is rolled out through a one-step kinematic bicycle model. Given the current ego state $(x,y,v,\theta)$ and wheelbase $L$,
+\begin{equation}
+\begin{aligned}
+v'
+&=
+\mathrm{clip}\!\left(v+a\Delta t,\,0,\,v_{\max}\right),\\
+\theta'
+&=
+\theta+\frac{v}{L}\tan\delta\,\Delta t,\\
+x'
+&=
+x+v'\cos\theta'\,\Delta t,\\
+y'
+&=
+y+v'\sin\theta'\,\Delta t.
+\end{aligned}
+\end{equation}
+Thus the utility evaluation is performed over the resulting candidate next state $(x',y',v',\theta')$, rather than over free speed/heading pairs. Importantly, $v'$ is constrained to be non-negative; negative-direction travel is represented by heading aligned with the corridor orientation.
+
+\subsection{Residual Multi-Agent Reinforcement Learning}
+Fixed utility parameters cannot fully capture adaptive negotiation, contextual yielding, temporary aggressiveness, or emergent interaction strategies. Therefore, a residual multi-agent reinforcement learning (MARL) policy modulates a subset of the utility parameters according to the local observation.
+
+The residual policy is
+\begin{equation}
+\Delta\Theta_{i}^{t}=\pi_{\phi}(o_{i}^{t}),
+\end{equation}
+and the adapted parameters are
+\begin{equation}
+\Theta_{i}^{t}
+=
+\mathrm{clip}\!\left(
+\Theta_{i}^{\mathrm{base}}+\Delta\Theta_{i}^{t}
+\right).
+\end{equation}
+Motion is then selected by utility maximization under the adapted parameters:
+\begin{equation}
+(a_{i}^{*},\delta_{i}^{*})
+=
+\arg\max_{(a,\delta)\in\mathcal{G}}
+U_{i}\!\left(s_{i}'(a,\delta);\Theta_{i}^{t}\right).
+\end{equation}
+Thus the RL policy does not directly output accelerations or trajectories; it only modulates the interpretable behavioral prior.
+
+\subsection{Policy Observation Space}
+Each agent receives a fully decentralized local observation consisting of ego kinematics, local goal orientation, corridor clearances, and relative neighbor states:
+\begin{equation}
+\begin{aligned}
+o_{i}^{t}
+=
+\Big[
+&x_{i},\;y_{i},\;v_{i},\;\theta_{i},\;\theta_{\mathrm{goal},i},\\
+&d_{\mathrm{lower},i},\;d_{\mathrm{upper},i},\\
+&\big\{\Delta x_{ij},\,\Delta y_{ij},\,\Delta v_{x,ij},\,\Delta v_{y,ij}\big\}_{j\in\mathcal{N}_{i}}
+\Big],
+\end{aligned}
+\end{equation}
+where $d_{\mathrm{lower},i}$ and $d_{\mathrm{upper},i}$ are clearances to the lower and upper corridor boundaries, and missing neighbors are zero-padded up to the fixed neighbor budget $K$. Relative velocities are represented as two-dimensional components.
+
+\subsection{Residual Action Space}
+The policy adapts both the magnitude and sensitivity of selected utility components, including the collision-kernel scales. The continuous residual action is nine-dimensional:
+\begin{equation}
+\Delta\Theta_{i}^{t}
+=
+\big[
+\Delta S_{v},\;
+\Delta S_{\theta},\;
+\Delta S_{d},\;
+\Delta w_{c},\;
+\Delta \xi_{i},\;
+\Delta \gamma,\;
+\Delta w_{\ell},\;
+\Delta \sigma_{\parallel},\;
+\Delta \sigma_{\perp}
+\big].
+\end{equation}
+The remaining utility parameters $(w_{x},w_{y},\beta)$ are treated as fixed geometric/shape priors in the current implementation. Residual actions are bounded (tanh-scaled per coordinate) and clipped to keep $\Theta_{i}^{t}$ within physically valid ranges.
+
+\subsection{Reward Function}
+The residual policy is trained with a multi-objective reward balancing progress, safety, control smoothness, and boundary feasibility:
+\begin{equation}
+R_{i}=w_{1}R_{\mathrm{progress}}+w_{2}R_{\mathrm{safety}}+w_{3}R_{\mathrm{smooth}}+R_{\mathrm{boundary}}
+\end{equation}
+
+The individual terms are
+\begin{equation}
+\label{eq:R_progress}
+R_{\mathrm{progress}}
+= v_{i}\cos(\theta_{i}-\theta_{\mathrm{goal},i}).
+\end{equation}
+\begin{equation}
+\label{eq:R_safety}
+R_{\mathrm{safety}}
+= -\sum_{j\in\mathcal{N}_{i}}\exp(-d_{ij}).
+\end{equation}
+\begin{equation}
+\label{eq:R_smooth}
+R_{\mathrm{smooth}}
+= -\left(a_{i}^{2}+\lambda_{\delta}\delta_{i}^{2}\right).
+\end{equation}
+\begin{equation}
+\label{eq:R_boundary}
+R_{\mathrm{boundary}}
+= \begin{cases}
+-\bigl(C_{\mathrm{out}}+c_{\mathrm{depth}}\min(d_{\mathrm{out}},d_{\max})\bigr), & \text{outside corridor},\\
+0, & \text{otherwise},
+\end{cases}
+\end{equation}
+where $a_{i}$ and $\delta_{i}$ are the executed bicycle controls, $\lambda_{\delta}$ weights steering cost, $C_{\mathrm{out}}>0$ is a base off-corridor penalty that exceeds the largest per-step progress reward, $d_{\mathrm{out}}$ is the penetration depth beyond the corridor edge, and $c_{\mathrm{depth}}$ provides a capped inward gradient ($d_{\max}$ prevents return-scale blow-up for untrained policies). An optional trajectory-matching term may be included when ground-truth imitation targets are available; in the present experiments it is set to zero.
+
+\subsection{Training Procedure}
+The residual policy is trained under centralized training and decentralized execution (CTDE). Episodes are initialized from observed traffic states derived from drone-based trajectory data. At each step:
+\begin{enumerate}
+    \item each agent receives its local observation $o_{i}^{t}$;
+    \item the policy outputs residuals $\Delta\Theta_{i}^{t}$;
+    \item utility parameters are updated and clipped;
+    \item discrete acceleration/steering candidates are generated and scored by the modulated utility;
+    \item the maximum-utility bicycle transition is executed.
+\end{enumerate}
+Importantly, the learned policy never directly commands unconstrained trajectories. Vehicle motion remains governed by utility maximization and kinematic bicycle constraints, preserving interpretability while enabling complex emergent interactions in weakly structured traffic.
+
+\section{Data Collection and Trajectory Extraction}
+\label{data_extraction}
+
+This study uses high-resolution aerial vehicle trajectories collected over multilane freeway segments in Jounieh, Lebanon, under weak lane discipline and heterogeneous traffic conditions. Traffic was recorded a drone in a near-stationary hover, providing a top-down view that reduces occlusions and supports simultaneous tracking of interacting vehicles. The site exhibits pronounced non-lane-based longitudinal and lateral interactions, including informal gap negotiation and shockwave-like disturbance propagation.
+
+Trajectory extraction and site characterization are documented in detail by Khoueiry et al. \cite{khoueiry2025universal}, readers are referred to \cite{khoueiry2025universal} for the full data-collection protocol and extraction pipeline. In this paper, we restrict attention to passenger-vehicle trajectories with valid kinematic transitions and use corridor-aligned geometry derived from the observed streams as the spatial reference for utility evaluation.
+
+\section{Calibration Methodology}
+\label{sec:calibration_methodology}
+
+The utility model in Eq.~\eqref{eq:utility} (directional alignment, speed alignment, proximity reward, collision penalty, and boundary adherence) contains twelve free parameters
+\[
+\theta=\bigl(S_\theta,\,S_v,\,\xi_i,\,S_d,\,\gamma,\,w_x,\,w_y,\,w_c,\,w_\ell,\,\beta,\,\sigma_{\parallel},\,\sigma_{\perp}\bigr),
+\]
+including the collision-kernel scales. These parameters are calibrated from the Lebanon naturalistic trajectory set so that the discrete utility prior reproduces observed short-horizon motion before any residual policy is trained.
+
+\paragraph{Data and candidate actions.}
+Valid passenger-vehicle transitions with time step $\Delta t\in[0.05,0.2]$\,s yield $190{,}767$ usable state records. From this pool we draw $N_{\mathrm{s}}=2000$ one-step choice samples. At each sample, the ego agent is reconstructed in the corridor frame with neighboring vehicles inside a $60$\,m radius (at most six neighbors). Candidate controls are generated on the same acceleration--steering grid used in simulation
+(acceleration $\in\{-3,\ldots,3\}$\,m/s$^2$, steering $\in[-0.45,0.45]$\,rad), producing a discrete action set $\mathcal{A}$. The observed next state is matched to the nearest candidate (target index) for likelihood evaluation.
+
+\paragraph{Closed-loop windows.}
+Because one-step ranking alone under-constrains $\theta$, we additionally sample $N_{\mathrm{w}}=40$ short trajectory windows of horizon $H=8$ steps. From the observed initial state of each window, the utility model repeatedly selects $\arg\max_{a\in\mathcal{A}} U(a;\theta)$ and the simulated pose/speed/heading are compared with the recorded trajectory.
+
+\paragraph{Objective.}
+Calibration minimizes a weighted composite loss
+\begin{equation}
+\begin{aligned}
+J(\theta)
+&=
+\lambda_{\mathrm{cl}}\,L_{\mathrm{cl}}(\theta)
++
+\lambda_{\mathrm{trk}}\,\frac{\bar r(\theta)}{r_0}
++
+\lambda_{\mathrm{nll}}\,L_{\mathrm{nll}}(\theta),
+\end{aligned}
+\label{eq:calibration_objective}
+\end{equation}
+where $L_{\mathrm{cl}}$ is the mean closed-loop tracking error (position, with speed and heading penalties), $\bar r$ is the mean rank of the observed-like candidate among $\mathcal{A}$, $r_0=63$ normalizes rank, and $L_{\mathrm{nll}}$ is the mean softmax negative log-likelihood of the target candidate at temperature $T=0.25$. We use $\lambda_{\mathrm{cl}}=1$, $\lambda_{\mathrm{trk}}=1$, and $\lambda_{\mathrm{nll}}=0.1$, so closed-loop fidelity is the primary target and the one-step likelihood acts as a light regularizer.
+
+\paragraph{Search and robust aggregation.}
+Because $J(\theta)$ is non-convex and partially flat, we do not trust a single optimizer trajectory. Parameters are drawn uniformly in the search box of Table~\ref{tab:utility_search_bounds}. For each of $R=3$ independent restarts (different random seeds), $N_{\mathrm{t}}=400$ vectors are screened by the cheap one-step terms; the best $80$ candidates per restart ($240$ scored trials in total) are then evaluated with the closed-loop windows. Let $\theta^\star$ be the minimizer of $J$ and define the near-optimal cloud as all scored trials with
+\[
+J(\theta)\le J(\theta^\star)+\max\bigl(0.05,\,0.05\,|J(\theta^\star)|\bigr).
+\]
+If fewer than three trials satisfy this cutoff, the top ten scored trials are used instead. The \emph{robust} working point $\theta_{\mathrm{rob}}$ is the coordinate-wise median of that cloud. This aggregation reduces sensitivity to isolated lucky minima while retaining the same predictive performance up to a small objective gap. Quantiles of the top/near-optimal clouds supply recommended ranges for subsequent global sensitivity analysis.
+
+\begin{table}[t]
+\centering
+\caption{Search bounds used in utility calibration.}
+\label{tab:utility_search_bounds}
+\begin{tabular}{lcc}
+\toprule
+Parameter & Low & High \\
+\midrule
+$S_\theta$, $S_v$, $S_d$ & $0.05$ & $10$ \\
+$\xi_i$ & $1.1$ & $10$ \\
+$\gamma$, $\beta$ & $0.1$ / $0.01$ & $10$ \\
+$w_x$, $w_y$ & $0.1$ & $10$ \\
+$w_c$, $w_\ell$ & $0.01$ / $0.1$ & $1000$ \\
+$\sigma_{\parallel}$ (m) & $0.5$ & $5$ \\
+$\sigma_{\perp}$ (m) & $0.3$ & $2.5$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\section{Calibration Results}
+\label{sec:calibration_results}
+
+\paragraph{Fit quality.}
+Across the $2000$ choice samples, the selected utility prior places the observed-like candidate at median rank $8$ (mean $11.1$--$11.4$), with top-$5$ and top-$10$ hit rates of $35.7\%$ and $62.9\%$, respectively. The best scored trial attains $J(\theta^\star)=1.132$ (closed-loop loss $0.549$), while the robust median $\theta_{\mathrm{rob}}$ yields $J=1.212$ (closed-loop loss $0.554$)---a modest degradation for a substantially more stable parameter vector. Per-vehicle local recalibrations on $200$ trajectories give a median closed-loop loss of $0.393$, indicating that short-horizon tracking remains consistent when parameters are allowed limited agent-specific adaptation. Rank CDFs, margin histograms, and closed-loop loss distributions are summarized in Fig.~\ref{fig:calibration_fit_quality}.
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=0.95\linewidth]{Pics/fig_fit_quality.png}
+\caption{Calibration fit diagnostics: empirical CDF and histogram of the observed-like candidate rank, utility margin relative to the best alternative (core p10--p99 window), and per-vehicle closed-loop tracking loss.}
+\label{fig:calibration_fit_quality}
+\end{figure*}
+
+\paragraph{Working parameters and uncertainty.}
+Table~\ref{tab:utility_calibration_params} reports the single best vector, the robust working point, and top-cloud percentiles after vehicle-scale collision-kernel recalibration. We recommend $\theta_{\mathrm{rob}}$ for all downstream simulation and residual learning:
+\[
+\begin{aligned}
+&S_\theta=6.50,\ 
+S_v=2.83,\ 
+\xi_i=3.76,\ 
+S_d=7.61,\ 
+\gamma=0.94,\\
+&w_x=6.33,\ 
+w_y=3.81,\ 
+w_c=316,\ 
+w_\ell=30.5,\ 
+\beta=3.71,\\
+&\sigma_{\parallel}=1.44\,\mathrm{m},\ 
+\sigma_{\perp}=1.10\,\mathrm{m}.
+\end{aligned}
+\]
+Relative to $\theta^\star$, the robust set pulls extreme weights inward (notably $w_c$ and $w_\ell$) while retaining metre-scale kernel widths consistent with passenger-car half-extents. Fig.~\ref{fig:calibration_param_dist} shows the global scored-trial distributions (histogram and KDE restricted to the central $95\%$ mass), and Fig.~\ref{fig:calibration_param_dist_per_id} reports the corresponding per-vehicle local-fit distributions.
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=\linewidth]{Pics/fig_parameter_distributions.png}
+\caption{Global scored-trial distributions of the twelve utility parameters ($240$ closed-loop-scored trials from three restarts). Histograms and KDEs are computed inside each parameter's central $95\%$ interval; vertical markers indicate the median, best, and robust values when they fall in that window.}
+\label{fig:calibration_param_dist}
+\end{figure*}
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=\linewidth]{Pics/fig_parameter_distributions_per_id.png}
+\caption{Per-vehicle local-fit parameter distributions ($200$ trajectories). Histograms and KDEs use the central $95\%$ mass for each coordinate.}
+\label{fig:calibration_param_dist_per_id}
+\end{figure*}
+
+\paragraph{Identifiability.}
+Of $240$ closed-loop-scored trials, only a small subset lies near $J(\theta^\star)$; the near-optimal/top cloud still exhibits large coefficient-of-variation across most coordinates (Fig.~\ref{fig:calibration_identifiability}). The strongest tradeoff is between $S_v$ and $\gamma$ (correlation $-0.85$), with additional coupling among $(S_\theta,S_v)$, $(w_x,w_c)$, and $(w_c,w_\ell)$. Thus the data identify a \emph{region} of acceptable utility weights more reliably than a unique point estimate.
+
+\paragraph{Implications.}
+For the remainder of this paper we (i)~fix $\theta_{\mathrm{rob}}$ as the nominal utility prior, (ii)~use the reported percentile ranges as bounds for global sensitivity analysis, and (iii)~interpret residual policy learning as refining behavior within an already plausible, but non-unique, utility basin.
+
+\begin{table*}[!t]
+\centering
+\caption{Calibrated utility parameters after vehicle-scale collision-kernel recalibration: best trial, robust median of the near-optimal cloud, and top-cloud $p_{50}$/$p_{95}$ (and $p_{2.5}$/$p_{97.5}$ for the kernel scales).}
+\label{tab:utility_calibration_params}
+\begin{tabular}{lrrrrr}
+\toprule
+Param. & Best & Robust & Top $p_{50}$ & Top $p_{95}$ \\
+\midrule
+$S_\theta$ & $1.293$ & $6.501$ & $4.847$ & $9.134$ \\
+$S_v$      & $8.854$ & $2.832$ & $2.666$ & $6.605$ \\
+$\xi_i$    & $5.320$ & $3.759$ & $4.431$ & $9.225$ \\
+$S_d$      & $8.056$ & $7.612$ & $6.181$ & $9.723$ \\
+$\gamma$   & $0.759$ & $0.943$ & $3.163$ & $8.211$ \\
+$w_x$      & $5.989$ & $6.335$ & $6.897$ & $9.826$ \\
+$w_y$      & $8.667$ & $3.810$ & $5.609$ & $9.503$ \\
+$w_c$      & $867.1$ & $315.9$ & $327.1$ & $874.0$ \\
+$w_\ell$   & $5.822$ & $30.55$ & $33.84$ & $148.9$ \\
+$\beta$    & $5.222$ & $3.711$ & $5.261$ & $8.812$ \\
+$\sigma_{\parallel}$ (m) & $2.161$ & $1.436$ & $2.471$ & $4.578$ \\
+$\sigma_{\perp}$ (m) & $1.972$ & $1.101$ & $1.357$ & $1.973$ \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\section{Experimental Setup for Residual Learning and Benchmarking}
+\label{sec:rl_setup}
+
+All residual-learning and baseline comparisons use a shared closed-loop harness on the Lebanon freeway corridor (\texttt{run\_id}$=2$, lane Kalman filter branch $1$). Agents are integrated with the kinematic bicycle model, collisions are detected with oriented bounding boxes (OBBs), and corridor feasibility is enforced in Frenet coordinates. Scenario seeds, spawn windows, and episode lengths are matched across models so that differences reflect controllers rather than initialization.
+
+\paragraph{Residual training.}
+The utility prior is frozen at the robust calibrated vector $\Theta_{\mathrm{base}}=\theta_{\mathrm{rob}}$ (Table~\ref{tab:utility_calibration_params}). A shared-policy PPO residual agent outputs the nine-dimensional $\Delta\Theta$ defined above (including collision-kernel scales $(\Delta\sigma_{\parallel},\Delta\sigma_{\perp})$). Observations are fully decentralized (ego kinematics, corridor clearances, and a fixed nearest-neighbor budget). Rewards follow Eqs.~\eqref{eq:R_progress}--\eqref{eq:R_boundary}, with a depth-capped off-road penalty that prevents progress-driven corridor cutting. Unless noted, residual checkpoints are trained under the sparse protocol below.
+
+\paragraph{Benchmark models.}
+The paper-facing comparison set is: ORCA, social force, dynamic window approach (DWA), model-predictive path-integral control (MPPI), MAPPO (pure MARL without a utility prior), the calibrated utility prior, and residual MARL. A Frenet lattice planner and alternative MARL variants (IPPO, HAPPO, HATRPO) were exercised in the same harness; they are omitted from the main table because of poor arrival/safety trade-offs or reward pathologies (high off-road rates / unstable returns), and are noted only as negative controls.
+
+\paragraph{Metrics.}
+We report mean collision events per episode, off-road rate, arrival rate, travel time, RMS jerk, and a realism score defined as the mean 1-D Wasserstein distance between simulated and measured marginals of speed, longitudinal acceleration, and lateral offset (lower is more human-like). Minimum TTC and related safety auxiliaries are logged but not emphasized in the main table.
+
+\paragraph{Protocols.}
+\emph{Sparse (main):} $10$ scenarios $\times$ $10$ agents with the default spawn window. \emph{Ablation:} the same seeds comparing the prior, residual MARL, a $\sigma$-frozen residual (kernel scales clamped to $\Theta_{\mathrm{base}}$), a sparse collision-penalty residual variant, and MAPPO. \emph{Dense stress:} $18$ agents with a tighter spawn window on the same corridor geometry, stressing negotiation density.
+
+\section{Residual MARL Results}
+\label{sec:residual_results}
+
+Table~\ref{tab:ablation} summarizes matched-seed ablations under the sparse protocol. Residual MARL reduces mean collisions from $14.4$ (utility prior) to $12.0$, a modest but consistent improvement, with comparable travel time and jerk. Freezing $(\Delta\sigma_{\parallel},\Delta\sigma_{\perp})$ raises collisions to $16.9$, worse than the unadapted prior: kernel-scale adaptation is therefore necessary for the residual to help rather than hurt. An auxiliary sparse collision-penalty residual further lowers collisions to $10.6$; we report this only as a sparse ablation (no dense-trained collpen checkpoint is claimed here).
+
+MAPPO remains the sparse efficiency leader (arrival $0.96$, travel time $32.4\,\mathrm{s}$, collisions $3.5$), but Section~\ref{sec:benchmark} shows that this comes with a large realism penalty. The denser stress protocol (Table~\ref{tab:stress}) is where residual adaptation is most valuable: collisions fall from $85.1$ (prior) to $64.7$ (residual), a reduction of $20.4$ events, while $\sigma$-frozen residual sits in between at $76.3$. Under density, MAPPO's collision count rises sharply to $81.3$ despite high arrival, indicating that pure MARL's sparse safety advantage does not transfer to the crowded regime.
+
+\begin{table}[!t]
+\centering
+\caption{Sparse matched-seed ablation ($10$ scenarios $\times$ $10$ agents). Collisions are mean events per episode.}
+\label{tab:ablation}
+\input{Pics/table_ablation.tex}
+\end{table}
+
+\begin{table}[!t]
+\centering
+\caption{Dense stress protocol ($18$ agents, tighter spawn). The sparse collision-penalty residual is omitted; only kernel-adaptation ablations are shown.}
+\label{tab:stress}
+\input{Pics/table_stress.tex}
+\end{table}
+
+\section{Benchmark}
+\label{sec:benchmark}
+
+Table~\ref{tab:benchmark_main} reports the main sparse comparison. Classical continuous-space planners dominate sparse safety: social force, ORCA, and DWA average $0.3$--$0.5$ collisions with high arrival and strong realism scores ($\approx 0.64$--$0.72$). Residual MARL improves the utility prior ($12.0$ vs.\ $14.4$ collisions) while remaining in a similar realism band ($0.77$ vs.\ $0.75$). MAPPO achieves the best sparse arrival and shortest travel time, but its realism score ($1.14$) is substantially worse than residual/prior, consistent with aggressive speed profiles.
+
+Fig.~\ref{fig:benchmark_metrics} summarizes metric distributions across models. Fig.~\ref{fig:realism_panel} contrasts empirical speed histograms: MAPPO exhibits a high-speed spike absent from the measured freeway traffic, whereas residual MARL and the utility prior remain close to the human marginal. Fig.~\ref{fig:stress_frenet} illustrates dense Frenet trajectories under stress, where residual agents negotiate tighter packs than the frozen prior while MAPPO maintains high throughput at the cost of denser conflict footprints.
+
+Overall, the benchmark supports a three-way trade-off: (i)~geometric planners lead sparse collision counts; (ii)~residual MARL is the strongest \emph{utility-family} controller, especially under density ($\Delta$collisions $-20.4$ vs.\ prior; $64.7$ vs.\ MAPPO's $81.3$); (iii)~pure MAPPO trades realism---and dense safety---for arrival and speed.
+
+\begin{table*}[!t]
+\centering
+\caption{Main sparse benchmark on the Lebanon freeway corridor ($10$ scenarios $\times$ $10$ agents; mean $\pm$ std across scenarios). Realism is mean Wasserstein distance to measured speed/acceleration/lateral marginals (lower is better).}
+\label{tab:benchmark_main}
+\input{Pics/table_benchmark_main.tex}
+\end{table*}
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=0.95\linewidth]{Pics/fig_benchmark_metrics.png}
+\caption{Sparse benchmark metric panel, including the realism score. Residual MARL improves prior collisions while remaining in the human-like realism band; MAPPO leads arrival/travel time with degraded realism.}
+\label{fig:benchmark_metrics}
+\end{figure*}
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=0.85\linewidth]{Pics/fig_realism_panel.png}
+\caption{Realism panel: measured vs.\ simulated speed distributions. MAPPO concentrates mass at high speeds; residual MARL and the utility prior track the empirical freeway marginal more closely.}
+\label{fig:realism_panel}
+\end{figure*}
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=0.95\linewidth]{Pics/fig_stress_frenet.png}
+\caption{Dense stress trajectories in Frenet $(s,d)$ coordinates for the utility prior, residual MARL, and MAPPO under the $18$-agent protocol.}
+\label{fig:stress_frenet}
+\end{figure*}
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented a utility-guided residual MARL framework for decentralized motion on a weak-lane freeway corridor. After calibrating a twelve-parameter prospect-theoretic prior with vehicle-scale collision kernels, a shared residual policy learns nine-dimensional parameter adjustments---including kernel scales---rather than raw controls. On matched closed-loop seeds, residual learning modestly improves sparse collisions relative to the prior and yields a large dense-stress gain ($-20.4$ collisions), while freezing $\Delta\sigma$ erases that benefit. Against classical planners and MAPPO, residual MARL occupies a middle ground: it does not match ORCA/social-force sparse safety, but it preserves human-like kinematics that pure MARL sacrifices and surpasses MAPPO on dense collisions. These results support residual utility adaptation as a practical route to context-dependent negotiation without abandoning interpretable behavioral structure.
+
+\section{Limitations}
+In calibration, although the calibrated utility prior provides a usable working point for residual learning, several limitations should be noted. First, the twelve-dimensional utility parameter vector is only weakly identified: multiple substantially different parameter combinations attain nearly the same closed-loop objective, with strong tradeoffs such as that between \(S_v\) and \(\gamma\). Consequently, the calibration identifies a region of acceptable behavior rather than a unique optimum, which is why we report a robust median of near-optimal trials together with percentile ranges instead of relying on a single best vector. Second, one-step ranking remains imperfect on the discrete candidate grid---the observed-like action is frequently competitive (median rank near eight; top-ten hit rate about \(63\%\)) but is rarely selected as the unique maximizer---so the one-step likelihood alone under-constrains the parameters and must be complemented by short-horizon closed-loop tracking. Third, per-vehicle local fits exhibit wide dispersion, indicating residual heterogeneity that a single population prior cannot fully capture. Finally, global sensitivity conclusions are meaningful only when Sobol ranges are aligned with the calibrated uncertainty region; using substantially narrower ad-hoc bounds can understate (or misattribute) parameter influence relative to the operating regime used downstream.
+
+\paragraph{Residual learning and benchmarking.}
+Closed-loop residual and baseline evaluations are freeway-only; roundabout transfer is left for future work. Even with kernel adaptation, residual MARL still trails classical geometric planners on sparse collision counts. Alternative MARL algorithms (IPPO, HAPPO, HATRPO) exhibited reward hacking or unstable returns in this harness and are not competitive paper baselines. Dense collision-penalty residual training was not completed for this draft, so the collpen variant is reported only under the sparse ablation.
+
+\bibliographystyle{IEEEtran} 
+\bibliography{example}
+
+\clearpage
+
+\appendices
+\section{Sensitivity Analysis}
+
+Understanding parameter sensitivity is crucial to ensure that the agent-based model produces reliable, realistic, and robust behavior under a wide range of conditions \cite{chandler1958traffic, talebpour2011multiregime}. The sensitivity analysis reveals how robust the model is to parameter variations and helps guide parameter tuning.
+
+To systematically assess model robustness, we perform both local and global sensitivity analyses. Local analysis examines the effect of small variations in individual parameters on each component of the utility function, providing insight into immediate system responsiveness. Global analysis, using techniques such as Sobol indices, quantifies the contribution of each parameter---including interactions---across their entire plausible range. Together, these analyses reveal how sensitive the model is to parameter changes and guide informed tuning for reliable and realistic agent behavior.
+
+In this chapter, we focus on the local sensitivity analysis, while the global sensitivity analysis will be conducted in a later stage of the dissertation.
+
+\section{Local Sensitivity Analysis}
+
+Local sensitivity analysis quantifies how small parameter perturbations affect each component of the utility. We analyze the five utility terms from Equation~\ref{eq:utilityRev}---directional alignment, speed incentive, proximity incentive, collision penalty, and path adherence---separately.
+
+\subsection*{Directional Alignment}
+Directional utility rewards candidate motion aligned with the local corridor tangent rather than a destination heading. Let \(\hat{m}\) denote the unit move direction induced by a candidate next position and \(\hat{t}\) the local corridor unit tangent. Then
+\begin{equation}
+\label{eq:Udir}
+U_{\mathrm{dir}}
+= S_{\theta}\,(\hat{m}\cdot\hat{t}).
+\end{equation}
+\begin{equation}
+\label{eq:dUdir_dStheta}
+\frac{\partial U_{\mathrm{dir}}}{\partial S_{\theta}}
+= \hat{m}\cdot\hat{t}.
+\end{equation}
+\begin{equation}
+\label{eq:dUdir_dalignment}
+\frac{\partial U_{\mathrm{dir}}}{\partial (\hat{m}\cdot\hat{t})}
+= S_{\theta}.
+\end{equation}
+
+Thus \(S_{\theta}\) linearly scales the directional reward. Utility is maximized when \(\hat{m}\cdot\hat{t}=1\) (perfect corridor alignment) and becomes negative when the candidate move opposes the corridor orientation. This remains valid for both positive- and negative-direction traffic because directionality is defined by corridor geometry.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.45\textwidth]{Appendix/directional_utility_surface_slices.png}
+    \caption{Directional utility \(U_{\mathrm{dir}}\) versus corridor alignment \(\hat{m}\cdot\hat{t}\) and directional sensitivity \(S_{\theta}\).}
+    \label{fig41}
+\end{figure}
+
+\subsection*{Speed Incentive}
+Speed utility rewards candidate bicycle-rollout speeds close to a desired speed. Define the symmetric closeness ratio
+\begin{equation}
+\rho
+=
+\frac{\min(v_{\mathrm{cand}},v_{\mathrm{des}})}{\max(v_{\mathrm{cand}},v_{\mathrm{des}})}
+\in(0,1],
+\end{equation}
+and
+\begin{equation}
+U_{\mathrm{speed}}
+=
+S_{v}
+\frac{\rho}{1+\rho^{(\xi_i-1)/2}}.
+\end{equation}
+The corresponding partial derivatives are
+\begin{align}
+\frac{\partial U_{\mathrm{speed}}}{\partial S_v}
+&=
+\frac{\rho}{1+\rho^{(\xi_i-1)/2}}, \\
+\frac{\partial U_{\mathrm{speed}}}{\partial \xi_i}
+&=
+-
+\frac{S_v\,\rho^{(\xi_i+1)/2}\ln\rho}{2\big(1+\rho^{(\xi_i-1)/2}\big)^2}.
+\end{align}
+Utility attains its maximum at \(v_{\mathrm{cand}}=v_{\mathrm{des}}\) (\(\rho=1\)). Overspeeding and underspeeding are penalized symmetrically. Larger \(\xi_i\) sharpens the drop in utility away from the desired speed, making the agent more sensitive to speed mismatch.
+
+\begin{figure*}[!t]
+    \centering
+    \includegraphics[width=1.0\textwidth]{Appendix/speed_utility_surface_slices.png}
+    \caption{Speed utility \(U_{\mathrm{speed}}\) versus candidate speed \(v_{\mathrm{cand}}\) and desired speed \(v_{\mathrm{des}}\) (with \(\xi_i\) slices).}
+    \label{fig42}
+\end{figure*}
+
+\subsection*{Proximity Incentive}
+Proximity utility encourages progress toward a local corridor reference expressed in Frenet coordinates. The effective distance is
+\begin{equation}
+d_{\mathrm{eff}}
+=
+w_x|\Delta s|
++
+w_y|\Delta n|,
+\end{equation}
+and
+\begin{equation}
+U_{\mathrm{dist}}
+=
+\frac{S_d}{1+(d_{\mathrm{eff}}/H_p)^{\gamma}},
+\quad
+H_p=\max(\kappa v_i,H_{\min}).
+\end{equation}
+The primary sensitivities are
+\begin{align}
+\frac{\partial U_{\mathrm{dist}}}{\partial S_d}
+&=
+\frac{1}{1+(d_{\mathrm{eff}}/H_p)^{\gamma}}, \\
+\frac{\partial U_{\mathrm{dist}}}{\partial \gamma}
+&=
+-
+S_d
+\frac{(d_{\mathrm{eff}}/H_p)^{\gamma}\ln(d_{\mathrm{eff}}/H_p)}{\big(1+(d_{\mathrm{eff}}/H_p)^{\gamma}\big)^2}, \\
+\frac{\partial U_{\mathrm{dist}}}{\partial d_{\mathrm{eff}}}
+&=
+-
+S_d
+\frac{\gamma (d_{\mathrm{eff}}/H_p)^{\gamma}}{d_{\mathrm{eff}}\big(1+(d_{\mathrm{eff}}/H_p)^{\gamma}\big)^2}, \\
+\frac{\partial U_{\mathrm{dist}}}{\partial H_p}
+&=
+S_d
+\frac{\gamma (d_{\mathrm{eff}}/H_p)^{\gamma}}{H_p\big(1+(d_{\mathrm{eff}}/H_p)^{\gamma}\big)^2}.
+\end{align}
+Here \(S_d\) scales importance, \(\gamma\) controls how quickly the reward decays outside the horizon, \(w_x\) and \(w_y\) weight longitudinal versus lateral Frenet error, and \(H_p\) softens normalized distance as speed increases.
+
+\begin{figure*}[!t]
+    \centering
+    \includegraphics[width=1.0\textwidth]{Appendix/proximity_utility_surface_slices.png}
+    \caption{Proximity utility \(U_{\mathrm{dist}}\) versus interaction exponent \(\gamma\), effective Frenet distance \(d_{\mathrm{eff}}\), and perception horizon \(H_p\).}
+    \label{fig43}
+\end{figure*}
+
+\subsection*{Collision-Risk Penalty}
+The primary partial derivatives for the collision-risk penalty are
+\begin{align}
+U_{\mathrm{col}}
+&=
+w_c \min(P_{i,g},1), \\
+\frac{\partial U_{\mathrm{col}}}{\partial w_c}
+&=
+\min(P_{i,g},1), \\
+\frac{\partial U_{\mathrm{col}}}{\partial P_{i,g}}
+&=
+w_c
+\quad\text{(when \(P_{i,g}<1\))}.
+\end{align}
+Increasing \(w_c\) makes the utility more sensitive to predicted collision probability and therefore promotes more risk-averse behavior.
+
+For the single-neighbor isotropic Gaussian case, let \(d=\|\vec r_g-\vec\mu_j\|\) and \(\Sigma_j=\sigma^2 I\). Then
+\begin{equation}
+P_{j,g}(d,\sigma)
+=
+\frac{1}{2\pi\sigma^2}
+\exp\!\left(-\frac{d^2}{2\sigma^2}\right),
+\end{equation}
+and the contribution to the penalty is proportional to \(w_c P_{j,g}\). Small \(\sigma\) creates a sharp localized risk field, while larger \(\sigma\) yields a broader but lower-amplitude risk region. Excessively large \(w_c\) can make agents overly cautious.
+
+\begin{figure*}[!t]
+    \centering
+    \includegraphics[width=1.0\textwidth]{Appendix/collision_utility_surface_slices.png}
+    \caption{Collision utility contribution versus distance to the predicted neighbor position \(d=\|\vec r_g-\vec\mu_j\|\) and prediction uncertainty \(\sigma\).}
+    \label{fig44}
+\end{figure*}
+
+\subsection*{Path Adherence}
+The path-adherence term and its derivatives are
+\begin{align}
+U_{\mathrm{path}}
+&=
+w_{\ell}\big(1-e^{-\beta\ell_i^2}\big), \\
+\frac{\partial U_{\mathrm{path}}}{\partial w_{\ell}}
+&=
+1-e^{-\beta\ell_i^2}, \\
+\frac{\partial U_{\mathrm{path}}}{\partial \beta}
+&=
+w_{\ell}\ell_i^2 e^{-\beta\ell_i^2}, \\
+\frac{\partial U_{\mathrm{path}}}{\partial \ell_i}
+&=
+2\,w_{\ell}\beta\ell_i e^{-\beta\ell_i^2}.
+\end{align}
+Here \(\ell_i\) is a non-negative corridor-boundary residual, \(w_{\ell}\) scales the penalty magnitude, and \(\beta\) controls how quickly the penalty saturates near the boundary. Larger \(w_{\ell}\) enforces stricter corridor adherence but may conflict with collision avoidance or progress when set excessively high.
+
+\begin{figure*}[!t]
+    \centering
+    \includegraphics[width=1.0\textwidth]{Appendix/path_adherence_utility_surface_slices.png}
+    \caption{Path-adherence utility \(U_{\mathrm{path}}\) versus path-deviation coefficient \(\beta\) and lateral deviation \(\ell_i\).}
+    \label{fig45}
+\end{figure*}
+
+\section{Global Sensitivity Analysis}
+
+Global Sensitivity Analysis (GSA) quantifies how uncertainty in the model output is attributed to uncertainty in the model parameters. Unlike local sensitivity analysis, which perturbs one parameter around a nominal value, GSA evaluates the entire parameter space and captures both direct parameter effects and higher-order interactions. This analysis identifies the most influential utility parameters, guides calibration efforts, and reveals parameters that have minimal influence on the model output.
+
+The proposed framework represents traffic agents moving in continuous two-dimensional space. At each simulation step, every agent generates feasible acceleration and steering candidates using the kinematic bicycle model and selects the candidate that maximizes the utility function defined in Equation~\ref{eq:utilityRev}. The utility consists of corridor directional preference, speed incentive, Frenet-distance proximity incentive, collision-risk penalty, and path-adherence penalty.
+
+The model performance is evaluated using the following simulation-level objective:
+\begin{equation}
+\label{eq:performance_metric_Y}
+Y
+=
+\sum_{k\in\mathcal{A}}
+d_k^{\mathrm{final}}
++
+N_{\mathrm{coll}}\,C_{\mathrm{penalty}},
+\end{equation}
+where \(d_k^{\mathrm{final}}\) denotes the final Euclidean distance between agent \(k\) and its destination, \(N_{\mathrm{coll}}\) is the total number of collision events during the simulation, and \(C_{\mathrm{penalty}}\) is a fixed collision penalty. Lower values of \(Y\) correspond to better overall system performance.
+
+The sensitivity analysis is performed using the variance-based Sobol method \cite{sobol1990sensitivity,saltelli2010variance}. Let the model output be
+
+\[
+Y=f(X_1,X_2,\ldots,X_D),
+\]
+
+where \(X_j\) represents independent model parameters. The output variance is decomposed as
+
+\begin{equation}
+\label{eq:variance_decomposition}
+\mathrm{Var}(Y)
+=
+\sum_{j=1}^{D}V_j
++
+\sum_{1\le j<k\le D}V_{jk}
++\cdots+
+V_{12\ldots D}.
+\end{equation}
+
+The first-order Sobol index is
+
+\begin{equation}
+\label{eq:S1_def}
+S_j
+=
+\frac{V_j}{\mathrm{Var}(Y)},
+\end{equation}
+
+while the total-order Sobol index is
+
+\begin{equation}
+\label{eq:ST_def}
+S_{T_j}
+=
+1-
+\frac{
+\mathrm{Var}_{\mathbf{X}_{\sim j}}
+\!\left(
+\mathbb{E}_{X_j}
+\left[
+Y\mid
+\mathbf{X}_{\sim j}
+\right]
+\right)
+}
+{\mathrm{Var}(Y)}.
+\end{equation}
+
+The first-order index quantifies the direct contribution of parameter \(X_j\) to the output variance, whereas the total-order index measures its overall contribution, including all interaction effects.
+
+Sampling is performed using Sobol quasi-random sequences generated with the \texttt{SALib} library. A base sample size of \(N=1024\) is used for the ten-dimensional parameter space, resulting in
+
+\[
+N_{\mathrm{eval}}
+=
+N(D+2)
+=
+1024(10+2)
+=
+12288
+\]
+
+simulation evaluations.
+
+Table~\ref{tab:gsa_param_ranges_report} summarizes the parameter ranges considered during the sensitivity analysis.
+
+\begin{table}[h]
+\centering
+\caption{Model parameters and predefined ranges used in the Sobol sensitivity analysis.}
+\label{tab:gsa_param_ranges_report}
+\begin{tabular}{llr}
+\hline
+Parameter & Description & Range\\
+\hline
+\(S_{\theta}\) & Corridor directional weight & \([0.2,1.0]\)\\
+\(S_v\) & Speed-incentive weight & \([0.2,1.0]\)\\
+\(\xi_i\) & Speed-mismatch steepness & \([1.5,3.5]\)\\
+\(S_d\) & Proximity-incentive weight & \([0.2,1.0]\)\\
+\(\gamma\) & Proximity decay steepness & \([0.5,3.0]\)\\
+\(w_x\) & Longitudinal Frenet weight & \([0.5,5.0]\)\\
+\(w_y\) & Lateral Frenet weight & \([0.5,5.0]\)\\
+\(w_c\) & Collision-risk penalty weight & \([0.1,20.0]\)\\
+\(w_{\ell}\) & Path-adherence penalty weight & \([5.0,50.0]\)\\
+\(\beta\) & Path-adherence saturation rate & \([0.1,5.0]\)\\
+\hline
+\end{tabular}
+\end{table}
+
+The proximity incentive employs the Frenet effective distance
+
+\begin{equation}
+d_{\mathrm{eff}}
+=
+w_x|\Delta s|
++
+w_y|\Delta n|,
+\end{equation}
+
+while the perception horizon is computed as
+
+\begin{equation}
+H_p
+=
+\max(\kappa v_i,H_{\min}).
+\end{equation}
+
+The speed incentive uses the normalized speed ratio
+
+\begin{equation}
+\rho
+=
+\frac{\min(v_{\mathrm{cand}},v_{\mathrm{des}})}
+{\max(v_{\mathrm{cand}},v_{\mathrm{des}})}.
+\end{equation}
+
+Collision risk follows the probabilistic formulation presented in the proposed methodology, where neighboring agents are propagated over the candidate time step and collision probabilities are accumulated before being weighted by \(w_c\).
+
+\subsection{Sensitivity Analysis Results}
+
+Table~\ref{tab:sobol_results} summarizes the estimated first-order and total-order Sobol indices for all utility parameters.
+
+\begin{table}[h]
+\centering
+\caption{Sobol sensitivity indices and associated confidence intervals.}
+\label{tab:sobol_results}
+\begin{tabular}{lcccc}
+\hline
+Parameter & \(S_1\) & \(S_{1,\mathrm{conf}}\) & \(S_T\) & \(S_{T,\mathrm{conf}}\)\\
+\hline
+\(S_{\theta}\) & 0.128 & 0.025 & 0.353 & 0.029\\
+\(S_v\)        & 0.287 & 0.031 & 0.598 & 0.041\\
+\(\xi_i\)      & -0.001 & 0.011 & 0.060 & 0.012\\
+\(S_d\)        & 0.005 & 0.010 & 0.035 & 0.006\\
+\(\gamma\)     & 0.003 & 0.006 & 0.021 & 0.005\\
+\(w_x\)        & 0.033 & 0.016 & 0.109 & 0.013\\
+\(w_y\)        & 0.017 & 0.011 & 0.065 & 0.011\\
+\(w_c\)        & 0.000 & 0.000 & 0.000 & 0.000\\
+\(w_{\ell}\)   & 0.043 & 0.022 & 0.247 & 0.027\\
+\(\beta\)      & 0.119 & 0.033 & 0.390 & 0.029\\
+\hline
+\end{tabular}
+\end{table}
+
+The sensitivity analysis demonstrates that the speed-incentive weight \(S_v\) is the dominant model parameter, exhibiting the largest first-order and total-order sensitivity indices. The path-adherence saturation parameter \(\beta\) and the corridor directional weight \(S_{\theta}\) are the next most influential parameters, followed by the path-adherence penalty weight \(w_{\ell}\). These four parameters account for the majority of the variance in the simulation-level performance metric.
+
+For the dominant parameters, the total-order indices are substantially larger than the corresponding first-order indices, indicating that their influence arises not only from direct effects but also through interactions with other utility terms. In contrast, the proximity-related parameters (\(S_d\), \(\gamma\), \(w_x\), and \(w_y\)) exhibit comparatively small sensitivities, suggesting that variations within the investigated ranges have only a limited impact on overall model performance.
+
+The collision-risk penalty weight \(w_c\) exhibits negligible first-order and total-order sensitivity, indicating that this parameter has little influence on the objective function for the evaluated scenarios. This behavior suggests that collision events are either infrequent or effectively avoided across the sampled parameter space, resulting in the collision penalty contributing minimally to the overall performance metric.
+
+Overall, the GSA indicates that calibration efforts should primarily focus on \(S_v\), \(\beta\), \(S_{\theta}\), and \(w_{\ell}\), while several remaining parameters may be assigned nominal values with relatively little effect on simulation performance within the investigated parameter ranges.
+
+\end{document}

@@ -96,6 +96,8 @@ DEFAULT_SIM_CONFIG: dict[str, Any] = {
     "collision_threshold": 0.5,
     "kappa_perception_horizon": 2.0,
     "min_perception_horizon": 5.0,
+    "vehicle_length": 2.0 * DEFAULT_SIGMA_LONG,
+    "vehicle_width": 2.0 * DEFAULT_SIGMA_LAT,
     # Variances = sigma^2 at vehicle half-extents (fallback if Θ has no sigma_*).
     "collision_pred_variances": [DEFAULT_SIGMA_LONG**2, DEFAULT_SIGMA_LAT**2],
     "max_agent_speed": 10.0,
@@ -334,6 +336,23 @@ def distance_reward_utility(
     return params["S_d"] / (1 + ratio ** params["gamma"])
 
 
+def _vehicle_footprint(sim_config: dict[str, Any]) -> tuple[float, float]:
+    length = float(sim_config.get("vehicle_length", 2.0 * DEFAULT_SIGMA_LONG))
+    width = float(sim_config.get("vehicle_width", 2.0 * DEFAULT_SIGMA_LAT))
+    return length, width
+
+
+def _body_frame_delta(
+    delta_world: np.ndarray,
+    heading: float,
+) -> np.ndarray:
+    """Rotate world Δ into the ego body frame (+x forward, +y left)."""
+    c = float(np.cos(heading))
+    s = float(np.sin(heading))
+    dx, dy = float(delta_world[0]), float(delta_world[1])
+    return np.array([c * dx + s * dy, -s * dx + c * dy], dtype=float)
+
+
 def collision_penalty(
     agent_i_idx: int,
     candidate_pos: np.ndarray,
@@ -341,23 +360,112 @@ def collision_penalty(
     params: dict[str, float],
     sim_config: dict[str, Any],
     time_to_reach: float,
+    candidate_heading: float | None = None,
 ) -> float:
-    """Paper Eqs. 8-12. Kernel width comes from Θ.sigma_* (vehicle-scale by default)."""
+    """Soft collision cost with vehicle-footprint support in the ego body frame.
+
+    Previous centre-to-centre world-axis Gaussian PDF was nearly zero at OBB
+    contact (~4.5 m longitudinal separation), so progress/speed terms dominated
+    and the prior rear-ended leaders. Here we:
+      1) express relative position in the candidate/ego heading frame, and
+      2) apply the anisotropic kernel to *surface gaps* beyond L×W half-extents,
+         so overlapping footprints yield unit presence (penalty ≈ w_c).
+    """
     p_sum = 0.0
     variances = collision_variances(params, sim_config)
-    det_sigma = variances[0] * variances[1]
-    pdf_norm = 1.0 / ((2 * np.pi) ** 1 * np.sqrt(det_sigma + 1e-18))
-    inv_sigma = np.diag(1.0 / (variances + 1e-9))
+    sig_long = float(np.sqrt(max(variances[0], 1e-12)))
+    sig_lat = float(np.sqrt(max(variances[1], 1e-12)))
+    length, width = _vehicle_footprint(sim_config)
+
+    ego = agents[agent_i_idx]
+    heading = (
+        float(candidate_heading)
+        if candidate_heading is not None
+        else float(ego.heading_angle if ego.heading_angle is not None else 0.0)
+    )
 
     for j, agent_j in enumerate(agents):
         if j == agent_i_idx:
             continue
-        mu_j = np.array(agent_j.pos) + np.array(agent_j.vel) * time_to_reach
-        diff_vec = np.array(candidate_pos) - mu_j
-        mahal_sq = float(diff_vec.T @ inv_sigma @ diff_vec)
-        p_sum += pdf_norm * np.exp(-0.5 * mahal_sq)
+        mu_j = np.asarray(agent_j.pos, dtype=float) + np.asarray(agent_j.vel, dtype=float) * time_to_reach
+        d_body = _body_frame_delta(np.asarray(candidate_pos, dtype=float) - mu_j, heading)
+        # Same-size vehicles: longitudinal/lateral centre separation must exceed
+        # full length/width before the footprints separate.
+        gap_long = max(0.0, abs(float(d_body[0])) - length)
+        gap_lat = max(0.0, abs(float(d_body[1])) - width)
+        mahal_sq = (gap_long / sig_long) ** 2 + (gap_lat / sig_lat) ** 2
+        p_sum += float(np.exp(-0.5 * mahal_sq))
 
-    return params["w_c"] * min(p_sum, 1.0)
+    return float(params["w_c"]) * min(p_sum, 1.0)
+
+
+def find_leading_agent_speed(
+    agent_idx: int,
+    agent: "TrafficAgent",
+    agents: list["TrafficAgent"],
+    sim_config: dict[str, Any],
+    corridor_geom: "CorridorGeometry | None" = None,
+    max_range: float = 40.0,
+) -> float | None:
+    """Nearest agent ahead used as a speed-alignment reference (car-following)."""
+    _, width = _vehicle_footprint(sim_config)
+    lateral_gate = 1.5 * width
+    best_ahead = float("inf")
+    lead_speed: float | None = None
+
+    if corridor_geom is not None:
+        s_i, n_i, _ = corridor_geom.project(agent.pos)
+        for j, other in enumerate(agents):
+            if j == agent_idx:
+                continue
+            s_j, n_j, _ = corridor_geom.project(other.pos)
+            ds = float(s_j - s_i)
+            if ds <= 1e-3 or ds > max_range:
+                continue
+            if abs(float(n_j - n_i)) > lateral_gate:
+                continue
+            if ds < best_ahead:
+                best_ahead = ds
+                lead_speed = float(other.speed)
+        return lead_speed
+
+    heading = float(agent.heading_angle if agent.heading_angle is not None else 0.0)
+    for j, other in enumerate(agents):
+        if j == agent_idx:
+            continue
+        d_body = _body_frame_delta(np.asarray(other.pos, dtype=float) - np.asarray(agent.pos, dtype=float), heading)
+        ahead, lateral = float(d_body[0]), float(d_body[1])
+        if ahead <= 1e-3 or ahead > max_range:
+            continue
+        if abs(lateral) > lateral_gate:
+            continue
+        if ahead < best_ahead:
+            best_ahead = ahead
+            lead_speed = float(other.speed)
+    return lead_speed
+
+
+def candidate_obb_conflict(
+    candidate: dict[str, Any],
+    agent_idx: int,
+    agents: list["TrafficAgent"],
+    sim_config: dict[str, Any],
+) -> bool:
+    """True if the candidate pose overlaps any constant-velocity neighbor OBB."""
+    from RL.corridor import boxes_overlap
+
+    length, width = _vehicle_footprint(sim_config)
+    cand_pos = np.asarray(candidate["pos"], dtype=float)
+    cand_heading = float(candidate.get("heading", 0.0))
+    dt = float(candidate.get("time_to_reach", sim_config.get("dt", 0.5)))
+    for j, other in enumerate(agents):
+        if j == agent_idx:
+            continue
+        mu = np.asarray(other.pos, dtype=float) + np.asarray(other.vel, dtype=float) * dt
+        other_heading = float(other.heading_angle if other.heading_angle is not None else 0.0)
+        if boxes_overlap(cand_pos, cand_heading, mu, other_heading, length, width):
+            return True
+    return False
 
 
 def path_adherence_penalty(
@@ -606,14 +714,26 @@ def evaluate_candidate_utility(
         )
         util_dist = distance_reward_utility(cand_pos, agent.dest, agent.speed, params, sim_config)
 
+    lead_speed = find_leading_agent_speed(
+        agent_idx, agent, agents, sim_config, corridor_geom=corridor_geom
+    )
     util_speed = speed_alignment_utility(
         cand_speed,
-        None,
+        lead_speed,
         agent.desired_speed,
         params,
-        perception_horizon_empty=True,
+        perception_horizon_empty=(lead_speed is None),
     )
-    penalty_coll = collision_penalty(agent_idx, cand_pos, agents, params, sim_config, time_to_reach)
+    cand_heading = candidate.get("heading")
+    penalty_coll = collision_penalty(
+        agent_idx,
+        cand_pos,
+        agents,
+        params,
+        sim_config,
+        time_to_reach,
+        candidate_heading=float(cand_heading) if cand_heading is not None else None,
+    )
     penalty_path = path_adherence_penalty(cand_pos, agent.nominal_y, params, sim_config)
 
     return util_dir + util_speed + util_dist - penalty_coll - penalty_path
@@ -626,13 +746,24 @@ def select_best_candidate(
     params: dict[str, float],
     sim_config: dict[str, Any],
 ) -> dict[str, Any]:
-    """argmax_a U(a; Θ) over discrete candidate actions."""
+    """argmax_a U(a; Θ) over discrete candidate actions.
+
+    Prefer candidates whose predicted OBB does not overlap any neighbor; if every
+    candidate overlaps, fall back to the soft-utility maximizer (usually braking).
+    """
     candidates = generate_candidate_actions(agent, sim_config["dt"], sim_config)
-    best = candidates[0]
-    best_u = -float("inf")
+    best_free: dict[str, Any] | None = None
+    best_free_u = -float("inf")
+    best_any = candidates[0]
+    best_any_u = -float("inf")
     for cand in candidates:
         u = evaluate_candidate_utility(agent_idx, agent, cand, agents, params, sim_config)
-        if u > best_u:
-            best_u = u
-            best = cand
-    return best
+        if u > best_any_u:
+            best_any_u = u
+            best_any = cand
+        if candidate_obb_conflict(cand, agent_idx, agents, sim_config):
+            continue
+        if u > best_free_u:
+            best_free_u = u
+            best_free = cand
+    return best_free if best_free is not None else best_any

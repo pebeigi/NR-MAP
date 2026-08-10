@@ -24,6 +24,8 @@ PANEL_METRICS = [
     ("arrival_rate", "Arrival rate", True),
     ("mean_speed_mps", "Mean speed (m/s)", True),
     ("rms_jerk", "RMS jerk (m/s^3)", False),
+    # Lower = closer to measured Lebanon distributions (mean 1-Wasserstein).
+    ("realism_score", "Realism distance to data", False),
 ]
 
 

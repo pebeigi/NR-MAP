@@ -3,6 +3,11 @@
 (1) Ablation — same scenarios, residual variants vs prior (and MAPPO):
       utility_pt | residual_marl | residual_sigma_frozen | residual_collpen | mappo
 
+    `residual_collpen` is reported as a *sparse* ablation unless it was trained
+    with `--dense-spawn` (crowded training distribution). The sparse-trained
+    collpen checkpoint improves the 10-agent setting but can underperform the
+    default residual under stress.
+
 (2) Stress — denser spawn (more agents, tighter packing) on the same models.
 
     python -m Baselines.ablation_stress --mode ablation
@@ -44,15 +49,20 @@ STRESS_SPAWN = {
 }
 
 
+_COLLPEN_CHECKPOINTS = {
+    "residual_collpen": Path("RL/checkpoints/residual_collpen_policy.pt"),
+    "residual_collpen_dense": Path("RL/checkpoints/residual_collpen_dense_policy.pt"),
+}
+
+
 def _available_models(models: list[str]) -> list[str]:
-    """Skip residual_collpen if its checkpoint has not been trained yet."""
+    """Skip collpen variants whose checkpoints have not been trained yet."""
     out = []
     for name in models:
-        if name == "residual_collpen":
-            ckpt = Path("RL/checkpoints/residual_collpen_policy.pt")
-            if not ckpt.exists():
-                print(f"[skip] {name}: {ckpt} not found (train with --collision-penalty first)")
-                continue
+        ckpt = _COLLPEN_CHECKPOINTS.get(name)
+        if ckpt is not None and not ckpt.exists():
+            print(f"[skip] {name}: {ckpt} not found (train with --collision-penalty first)")
+            continue
         out.append(name)
     return out
 

@@ -100,6 +100,18 @@ python -m Baselines.train_pure_rl --updates 200 --episodes-per-update 4 --num-ag
 python -m Baselines.train_marl --algo mappo  --updates 200
 python -m Baselines.train_marl --algo happo  --updates 200
 python -m Baselines.train_marl --algo hatrpo --updates 200
+
+# Optional: collision-aware residual (sparse ablation), or dense-trained variant
+python -m RL.train_ppo --updates 100 --collision-penalty 5.0 \
+    --save RL/checkpoints/residual_collpen_policy.pt
+python -m RL.train_ppo --updates 100 --num-agents 16 --collision-penalty 5.0 --dense-spawn \
+    --save RL/checkpoints/residual_collpen_dense_policy.pt
+```
+
+Paper figures (metrics with realism, distribution panel, stress Frenet):
+
+```bash
+python -m Baselines.paper_figures --all
 ```
 
 Run the benchmark:
