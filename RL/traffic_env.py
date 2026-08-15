@@ -19,6 +19,8 @@ from RL.corridor import (
     corridor_sim_defaults,
     load_corridor,
 )
+from RL.behavior_reference import FEATURES as BEHAVIOR_FEATURES
+from RL.behavior_reference import load_behavior_reference
 from utility_model import (
     DEFAULT_BASE_PARAMS,
     DEFAULT_SIM_CONFIG,
@@ -48,6 +50,15 @@ class EnvConfig:
     # involved in a collision this step. Soft proximity (r_safety) alone is too
     # weak for residual learning to care about vehicle-scale overlaps.
     collision_penalty: float = 0.0
+    # Behavioral data terms. ``behavior_coef`` weights a per-agent penalty for
+    # leaving the observed band of each marginal. ``behavior_shaping_coef``
+    # weights potential-based shaping on the episode's distance to the measured
+    # marginals, which telescopes to the realism score actually reported, so the
+    # distribution shape is optimized during training instead of only measured.
+    behavior_coef: float = 0.0
+    behavior_shaping_coef: float = 0.0
+    behavior_warmup_steps: int = 10
+    behavior_csv: str | None = None
     sim_config: dict[str, Any] | None = None
     base_params: dict[str, float] | None = None
 
@@ -109,6 +120,16 @@ class MultiAgentTrafficEnv:
         self.agents: list[TrafficAgent] = []
         self.step_count = 0
         self.collision_count = 0
+        self.behavior_reference = None
+        if self.config.behavior_coef > 0.0 or self.config.behavior_shaping_coef > 0.0:
+            self.behavior_reference = load_behavior_reference(
+                self.config.run_id,
+                self.config.lane_kf,
+                float(self.config.dt),
+                self.config.behavior_csv,
+            )
+        self._behavior_samples: dict[str, list[float]] = {k: [] for k in BEHAVIOR_FEATURES}
+        self._behavior_potential: float | None = None
 
     @property
     def obs_dim(self) -> int:
@@ -125,6 +146,8 @@ class MultiAgentTrafficEnv:
         self.step_count = 0
         self.collision_count = 0
         self._dest_s = []
+        self._behavior_samples = {k: [] for k in BEHAVIOR_FEATURES}
+        self._behavior_potential = None
         self.agents = self._spawn_agents()
         return [self.get_observation(i) for i in range(len(self.agents))]
 
@@ -228,13 +251,14 @@ class MultiAgentTrafficEnv:
         agent_idx: int,
         accel: np.ndarray,
         control: dict[str, float] | None = None,
+        candidate: dict[str, Any] | None = None,
     ) -> float:
         ego = self.agents[agent_idx]
         w = self.config.reward_weights
         sim = self.config.sim_config
         steering_weight = float(sim.get("steering_penalty_weight", 0.5))
 
-        _, _, tangent, _, _ = self.corridor.project(ego.pos)
+        _, lateral, tangent, _, _ = self.corridor.project(ego.pos)
         tangent_angle = float(np.arctan2(tangent[1], tangent[0]))
         r_progress = ego.speed * np.cos(ego.heading - tangent_angle)
 
@@ -254,12 +278,25 @@ class MultiAgentTrafficEnv:
         r_boundary, _ = boundary_reward(c_lo, c_hi)
         r_traj = 0.0
 
+        r_behavior = 0.0
+        if self.behavior_reference is not None:
+            # Speed and acceleration come from the selected candidate so the term
+            # depends on this step's action; lateral offset is the current pose.
+            speed = float(candidate["speed"]) if candidate is not None else float(ego.speed)
+            step_accel = float(control.get("accel", 0.0)) if control is not None else 0.0
+            self._behavior_samples["speed"].append(speed)
+            self._behavior_samples["accel"].append(step_accel)
+            self._behavior_samples["lateral"].append(float(lateral))
+            if self.config.behavior_coef > 0.0:
+                r_behavior = -self.behavior_reference.step_deviation(speed, step_accel, lateral)
+
         return (
             w["progress"] * r_progress
             + w["safety"] * r_safety
             + w["smooth"] * r_smooth
             + r_boundary
             + w["traj"] * r_traj
+            + self.config.behavior_coef * r_behavior
         )
 
     def step(
@@ -297,7 +334,9 @@ class MultiAgentTrafficEnv:
                 "steering": float(chosen.get("steering_angle", 0.0)),
             }
             selected_controls.append(control)
-            rewards.append(self._compute_reward(i, agent.prev_accel, control=control))
+            rewards.append(
+                self._compute_reward(i, agent.prev_accel, control=control, candidate=chosen)
+            )
             intended_moves.append(chosen)
 
         for i, agent in enumerate(self.agents):
@@ -319,6 +358,22 @@ class MultiAgentTrafficEnv:
 
         observations = [self.get_observation(i) for i in range(len(self.agents))]
         done = self.step_count >= self.config.max_steps or all(a.reached_destination for a in self.agents)
+
+        realism_distance = float("nan")
+        if self.behavior_reference is not None:
+            realism_distance = self.behavior_distance()
+            if (
+                self.config.behavior_shaping_coef > 0.0
+                and self.step_count > self.config.behavior_warmup_steps
+            ):
+                # Potential-based shaping: the per-step increments telescope to the
+                # episode's realism distance, giving a dense signal for it.
+                previous = self._behavior_potential
+                if previous is not None:
+                    shared = self.config.behavior_shaping_coef * (realism_distance - previous)
+                    rewards = [r - shared for r in rewards]
+            self._behavior_potential = realism_distance
+
         info = {
             "collision_count": self.collision_count,
             "steps": self.step_count,
@@ -327,8 +382,16 @@ class MultiAgentTrafficEnv:
             "run_id": self.config.run_id,
             "lane_kf": self.config.lane_kf,
             "colliding_agents": sorted(hit),
+            "realism_distance": realism_distance,
         }
         return observations, rewards, done, info
+
+    def behavior_distance(self) -> float:
+        """Normalized W1 between this episode's marginals and the measured ones."""
+        if self.behavior_reference is None:
+            return float("nan")
+        samples = {k: np.asarray(v, dtype=float) for k, v in self._behavior_samples.items()}
+        return self.behavior_reference.distribution_distance(samples)
 
     def _update_destination_flag(self, agent_idx: int) -> None:
         """

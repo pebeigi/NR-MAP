@@ -13,7 +13,7 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -136,6 +136,9 @@ def corridor_geometry_from_map(
     return CorridorGeometry.from_center(center)
 
 
+_BOUNDARY_ARRAY_CACHE: Dict[int, Tuple[np.ndarray, ...]] = {}
+
+
 def project_points_on_corridor(
     corridor: CorridorGeometry,
     points: np.ndarray,
@@ -183,34 +186,48 @@ def corridor_choice_features(
     return dir_cos, dist_abs
 
 
-def closest_boundary_points(points: np.ndarray, boundary: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-    """Interpolate lower/upper boundary points at closest centerline segment for each point."""
+def _boundary_arrays(boundary: pd.DataFrame) -> tuple[np.ndarray, ...]:
+    """Cached numpy view of one run/lane boundary plus precomputed segment terms."""
+    key = id(boundary)
+    cached = _BOUNDARY_ARRAY_CACHE.get(key)
+    if cached is not None:
+        return cached
     center = boundary[["center_x", "center_y"]].to_numpy(float)
     lower = boundary[["lower_x", "lower_y"]].to_numpy(float)
     upper = boundary[["upper_x", "upper_y"]].to_numpy(float)
+    if len(center) >= 2:
+        ab = center[1:] - center[:-1]
+        denom = np.einsum("ij,ij->i", ab, ab) + 1e-12
+    else:
+        ab = np.zeros((0, 2), dtype=float)
+        denom = np.zeros(0, dtype=float)
+    cached = (center, lower, upper, ab, denom)
+    _BOUNDARY_ARRAY_CACHE[key] = cached
+    return cached
+
+
+def closest_boundary_points(points: np.ndarray, boundary: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """Interpolate lower/upper boundary points at closest centerline segment for each point.
+
+    Vectorized over points and segments: the scalar double loop dominated the
+    closed-loop calibration objective (~88% of rollout time).
+    """
+    center, lower, upper, ab, denom = _boundary_arrays(boundary)
+    points = np.atleast_2d(np.asarray(points, dtype=float))
     if len(center) < 2:
         return np.repeat(lower[:1], len(points), axis=0), np.repeat(upper[:1], len(points), axis=0)
 
-    out_lower = np.zeros((len(points), 2), dtype=float)
-    out_upper = np.zeros((len(points), 2), dtype=float)
-    for p_idx, point in enumerate(points):
-        best_dist = float("inf")
-        best_i = 0
-        best_t = 0.0
-        for i in range(len(center) - 1):
-            a = center[i]
-            b = center[i + 1]
-            ab = b - a
-            denom = float(ab @ ab) + 1e-12
-            t = float(np.clip(((point - a) @ ab) / denom, 0.0, 1.0))
-            q = a + t * ab
-            dist = float(np.linalg.norm(point - q))
-            if dist < best_dist:
-                best_dist = dist
-                best_i = i
-                best_t = t
-        out_lower[p_idx] = (1.0 - best_t) * lower[best_i] + best_t * lower[best_i + 1]
-        out_upper[p_idx] = (1.0 - best_t) * upper[best_i] + best_t * upper[best_i + 1]
+    # (N, S) projection parameter of each point onto each centerline segment.
+    ap = points[:, None, :] - center[None, :-1, :]
+    t = np.clip(np.einsum("nsk,sk->ns", ap, ab) / denom[None, :], 0.0, 1.0)
+    q = center[None, :-1, :] + t[:, :, None] * ab[None, :, :]
+    d2 = np.sum((points[:, None, :] - q) ** 2, axis=2)
+    best_i = np.argmin(d2, axis=1)
+    rows = np.arange(len(points))
+    best_t = t[rows, best_i][:, None]
+
+    out_lower = (1.0 - best_t) * lower[best_i] + best_t * lower[best_i + 1]
+    out_upper = (1.0 - best_t) * upper[best_i] + best_t * upper[best_i + 1]
     return out_lower, out_upper
 
 
@@ -619,29 +636,37 @@ def select_best_candidate_with_boundary(
     return candidates[int(np.argmax(utilities))]
 
 
-def sample_rollout_windows(
-    df: pd.DataFrame,
-    n_windows: int,
-    horizon_steps: int,
-    seed: int,
-) -> list[RolloutWindow]:
-    if n_windows <= 0 or horizon_steps <= 0:
-        return []
+TrajectoryGroup = Tuple[int, int, List[Dict[str, Any]]]
 
-    groups: list[tuple[int, int, list[dict[str, Any]]]] = []
-    starts: list[tuple[int, int]] = []
+
+def enumerate_trajectory_groups(df: pd.DataFrame) -> list[TrajectoryGroup]:
+    """One entry per (run_id, vehicle_id) trajectory, sorted by time."""
+    groups: list[TrajectoryGroup] = []
     for (run_id, vehicle_id), group in df.groupby(["run_id", "id"], sort=True):
         rows = group.sort_values("time").to_dict("records")
         if len(rows) < 2:
             continue
-        group_idx = len(groups)
         groups.append((int(run_id), int(vehicle_id), rows))
-        starts.extend((group_idx, start) for start in range(len(rows) - 1))
+    return groups
 
+
+def windows_from_groups(
+    groups: list[TrajectoryGroup],
+    group_indices: np.ndarray | list[int],
+    n_windows: int,
+    horizon_steps: int,
+    rng: np.random.Generator,
+) -> list[RolloutWindow]:
+    """Sample short windows drawn only from the given trajectories."""
+    if n_windows <= 0 or horizon_steps <= 0:
+        return []
+    starts: list[tuple[int, int]] = []
+    for gi in group_indices:
+        rows = groups[int(gi)][2]
+        starts.extend((int(gi), start) for start in range(len(rows) - 1))
     if not starts:
         return []
 
-    rng = np.random.default_rng(seed)
     selected = rng.choice(len(starts), size=min(n_windows, len(starts)), replace=False)
     windows: list[RolloutWindow] = []
     for idx in selected:
@@ -660,6 +685,68 @@ def sample_rollout_windows(
             )
         )
     return windows
+
+
+def sample_rollout_windows(
+    df: pd.DataFrame,
+    n_windows: int,
+    horizon_steps: int,
+    seed: int,
+) -> list[RolloutWindow]:
+    if n_windows <= 0 or horizon_steps <= 0:
+        return []
+    groups = enumerate_trajectory_groups(df)
+    if not groups:
+        return []
+    rng = np.random.default_rng(seed)
+    return windows_from_groups(groups, range(len(groups)), n_windows, horizon_steps, rng)
+
+
+def split_rollout_windows(
+    df: pd.DataFrame,
+    horizon_steps: int,
+    seed: int,
+    n_train: int,
+    n_val: int,
+    n_test: int,
+    group_fractions: tuple[float, float] = (0.6, 0.2),
+) -> tuple[list[RolloutWindow], list[RolloutWindow], list[RolloutWindow], dict[str, Any]]:
+    """Split windows into train/validation/test by *vehicle*, not by window.
+
+    Windows starting at consecutive indices of one trajectory overlap almost
+    entirely, so splitting windows directly would leak calibration data into the
+    held-out sets. Partitioning whole trajectories keeps the splits independent.
+    """
+    groups = enumerate_trajectory_groups(df)
+    if not groups:
+        return [], [], [], {"n_vehicles": 0}
+
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(len(groups))
+    n_groups = len(order)
+    n_train_groups = int(round(group_fractions[0] * n_groups))
+    n_val_groups = int(round(group_fractions[1] * n_groups))
+    n_train_groups = max(1, min(n_train_groups, n_groups - 2))
+    n_val_groups = max(1, min(n_val_groups, n_groups - n_train_groups - 1))
+    train_groups = order[:n_train_groups]
+    val_groups = order[n_train_groups : n_train_groups + n_val_groups]
+    test_groups = order[n_train_groups + n_val_groups :]
+
+    train = windows_from_groups(groups, train_groups, n_train, horizon_steps, rng)
+    val = windows_from_groups(groups, val_groups, n_val, horizon_steps, rng)
+    test = windows_from_groups(groups, test_groups, n_test, horizon_steps, rng)
+    info = {
+        "n_vehicles": int(n_groups),
+        "n_vehicles_train": int(len(train_groups)),
+        "n_vehicles_val": int(len(val_groups)),
+        "n_vehicles_test": int(len(test_groups)),
+        "n_windows_train": len(train),
+        "n_windows_val": len(val),
+        "n_windows_test": len(test),
+        "horizon_steps": int(horizon_steps),
+        "split_by": "vehicle_trajectory",
+    }
+    return train, val, test, info
 
 
 def rollout_loss(
@@ -1046,6 +1133,56 @@ def evaluate_params_objective(
     )
 
 
+def _held_out_selection(
+    result: dict[str, Any],
+    all_scored: list[tuple[float, float, float, float, dict[str, float], int, int]],
+    grouped_by_time: dict[tuple[float, float], pd.DataFrame],
+    sim_config: dict[str, Any],
+    args: argparse.Namespace,
+    boundary_map: BoundaryMap,
+    val_windows: list[RolloutWindow],
+    test_windows: list[RolloutWindow],
+) -> dict[str, Any]:
+    """Select the working parameters on validation windows and score them on test."""
+    out: dict[str, Any] = {}
+    if not val_windows:
+        return out
+
+    def closed_loop(params: dict[str, float], w: list[RolloutWindow]) -> float:
+        if not w:
+            return float("nan")
+        return float(rollout_loss(w, grouped_by_time, params, sim_config, args, boundary_map))
+
+    candidates = {
+        "best": result["best_params"],
+        "robust": result["robust_params"],
+    }
+    val_losses = {name: closed_loop(params, val_windows) for name, params in candidates.items()}
+    out["val_closed_loop_loss"] = {k: float(v) for k, v in val_losses.items()}
+
+    # Validation spread across the fit-acceptable cloud: how much does the choice
+    # of point inside the near-optimal region matter out of sample?
+    top_k = max(int(getattr(args, "val_top_k", 0)), 0)
+    if top_k:
+        near_sorted = sorted(all_scored, key=lambda row: row[0])[:top_k]
+        cloud = [closed_loop(row[4], val_windows) for row in near_sorted]
+        cloud = [c for c in cloud if np.isfinite(c)]
+        if cloud:
+            out["val_closed_loop_cloud"] = {
+                "n": len(cloud),
+                "min": float(np.min(cloud)),
+                "p50": float(np.median(cloud)),
+                "max": float(np.max(cloud)),
+                "std": float(np.std(cloud)),
+            }
+
+    selected = min(val_losses, key=lambda k: val_losses[k])
+    out["working_params"] = candidates[selected]
+    out["working_params_source"] = f"{selected}_selected_on_validation_windows"
+    out["test_closed_loop_loss"] = float(closed_loop(candidates[selected], test_windows))
+    return out
+
+
 def calibrate(
     samples: list[ChoiceSample],
     windows: list[RolloutWindow],
@@ -1053,8 +1190,16 @@ def calibrate(
     sim_config: dict[str, Any],
     args: argparse.Namespace,
     boundary_map: BoundaryMap,
+    val_windows: list[RolloutWindow] | None = None,
+    test_windows: list[RolloutWindow] | None = None,
+    split_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Multi-restart random search with robust near-optimal parameter aggregation."""
+    """Multi-restart random search with robust near-optimal parameter aggregation.
+
+    Fitting uses ``windows``; ``val_windows`` selects the working parameter vector
+    among fit-acceptable candidates; ``test_windows`` is touched once, only for the
+    selected vector, so the reported closed-loop number is genuinely held out.
+    """
     n_restarts = max(int(getattr(args, "n_restarts", 1)), 1)
     all_scored: list[tuple[float, float, float, float, dict[str, float], int, int]] = []
     for restart in range(n_restarts):
@@ -1092,6 +1237,21 @@ def calibrate(
     result["robust_tracking_rank"] = float(robust_track * max(args.tracking_rank_normalizer, 1.0))
     result["working_params"] = result["robust_params"]
     result["working_params_source"] = "median_of_near_optimal_trials"
+    if split_info:
+        result["window_split"] = dict(split_info)
+
+    result.update(
+        _held_out_selection(
+            result,
+            all_scored,
+            grouped_by_time,
+            sim_config,
+            args,
+            boundary_map,
+            val_windows or [],
+            test_windows or [],
+        )
+    )
 
     idinfo = result["identifiability"]
     log_progress(
@@ -1688,7 +1848,11 @@ def write_diagnostics(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Calibrate utility ranges from trajectory data")
-    parser.add_argument("--csv", type=Path, default=REPO_ROOT / "data" / "Final_Lebanon_Data.csv")
+    parser.add_argument(
+        "--csv",
+        type=Path,
+        default=REPO_ROOT / "data" / "Lebanon_Highway" / "Final_Lebanon_Data.csv",
+    )
     parser.add_argument("--output", type=Path, default=REPO_ROOT / "Calibration" / "utility_calibration.json")
     parser.add_argument("--n-samples", type=int, default=2000)
     parser.add_argument("--n-trials", type=int, default=400)
@@ -1715,8 +1879,34 @@ def main() -> None:
     parser.add_argument(
         "--closed-loop-windows",
         type=int,
-        default=40,
+        default=300,
         help="Number of short trajectory windows used in the closed-loop calibration objective",
+    )
+    parser.add_argument(
+        "--closed-loop-val-windows",
+        type=int,
+        default=100,
+        help="Held-out windows used to select the working parameter vector (0 disables)",
+    )
+    parser.add_argument(
+        "--closed-loop-test-windows",
+        type=int,
+        default=100,
+        help="Held-out windows scored once, only for the selected working vector",
+    )
+    parser.add_argument(
+        "--window-split-fractions",
+        type=float,
+        nargs=2,
+        default=(0.6, 0.2),
+        metavar=("TRAIN", "VAL"),
+        help="Fraction of vehicle trajectories assigned to train and validation (rest is test)",
+    )
+    parser.add_argument(
+        "--val-top-k",
+        type=int,
+        default=10,
+        help="Score this many best-on-train trials on validation to report the cloud spread",
     )
     parser.add_argument(
         "--closed-loop-horizon-steps",
@@ -1774,7 +1964,13 @@ def main() -> None:
     parser.add_argument(
         "--boundary-csv",
         type=Path,
-        default=REPO_ROOT / "data" / "derived_highway_boundaries" / "highway_boundaries.csv",
+        default=(
+            REPO_ROOT
+            / "data"
+            / "Lebanon_Highway"
+            / "derived_highway_boundaries"
+            / "highway_boundaries.csv"
+        ),
         help="Optional highway boundary CSV to overlay on all_agents_xy.png",
     )
     parser.add_argument("--no-plots", action="store_true", help="Skip calibration diagnostic plots")
@@ -1827,20 +2023,35 @@ def main() -> None:
     samples = sample_choices(df, args, cfg.sim_config, boundary_map)
     if not samples:
         raise RuntimeError("No calibration samples built from trajectory data")
-    rollout_windows = sample_rollout_windows(
+    rollout_windows, val_windows, test_windows, split_info = split_rollout_windows(
         df,
-        n_windows=args.closed_loop_windows,
         horizon_steps=args.closed_loop_horizon_steps,
         seed=args.seed,
+        n_train=args.closed_loop_windows,
+        n_val=args.closed_loop_val_windows,
+        n_test=args.closed_loop_test_windows,
+        group_fractions=tuple(args.window_split_fractions),
     )
     grouped_by_time = {key: group for key, group in df.groupby(["run_id", "time"], sort=False)}
     log_progress(
-        f"Prepared {len(rollout_windows)} closed-loop windows "
-        f"(horizon={args.closed_loop_horizon_steps} steps each).",
+        f"Prepared closed-loop windows (horizon={args.closed_loop_horizon_steps} steps): "
+        f"{len(rollout_windows)} train / {len(val_windows)} val / {len(test_windows)} test "
+        f"from {split_info.get('n_vehicles', 0)} vehicle trajectories "
+        f"(disjoint vehicles per split).",
         args.verbose,
     )
 
-    result = calibrate(samples, rollout_windows, grouped_by_time, cfg.sim_config, args, boundary_map)
+    result = calibrate(
+        samples,
+        rollout_windows,
+        grouped_by_time,
+        cfg.sim_config,
+        args,
+        boundary_map,
+        val_windows=val_windows,
+        test_windows=test_windows,
+        split_info=split_info,
+    )
     log_progress("Global calibration finished.", args.verbose)
     result["boundary_summary_pca"] = boundary_summary(df)
     result["candidate_grid"] = {
@@ -1871,8 +2082,34 @@ def main() -> None:
     print(f"Wrote {args.output}", flush=True)
     print("Best objective:", f"{result['best_objective']:.4f}", flush=True)
     print("Robust objective:", f"{result['robust_objective']:.4f}", flush=True)
-    print("Best closed-loop loss:", f"{result['best_closed_loop_loss']:.4f}", flush=True)
-    print("Robust closed-loop loss:", f"{result['robust_closed_loop_loss']:.4f}", flush=True)
+    print("Best closed-loop loss (train):", f"{result['best_closed_loop_loss']:.4f}", flush=True)
+    print("Robust closed-loop loss (train):", f"{result['robust_closed_loop_loss']:.4f}", flush=True)
+    if result.get("val_closed_loop_loss"):
+        val = result["val_closed_loop_loss"]
+        print(
+            "Validation closed-loop loss:",
+            ", ".join(f"{k}={v:.4f}" for k, v in val.items()),
+            flush=True,
+        )
+        print(f"Working params: {result.get('working_params_source')}", flush=True)
+    if np.isfinite(result.get("test_closed_loop_loss", float("nan"))):
+        print("Test closed-loop loss:", f"{result['test_closed_loop_loss']:.4f}", flush=True)
+    if result.get("val_closed_loop_cloud"):
+        cloud = result["val_closed_loop_cloud"]
+        print(
+            "Validation spread over top trials: "
+            f"n={cloud['n']}, min={cloud['min']:.4f}, p50={cloud['p50']:.4f}, "
+            f"max={cloud['max']:.4f}, std={cloud['std']:.4f}",
+            flush=True,
+        )
+    if result.get("window_split"):
+        sp = result["window_split"]
+        print(
+            "Window split: "
+            f"{sp['n_windows_train']}/{sp['n_windows_val']}/{sp['n_windows_test']} windows from "
+            f"{sp['n_vehicles_train']}/{sp['n_vehicles_val']}/{sp['n_vehicles_test']} vehicles",
+            flush=True,
+        )
     print("Best mean target rank:", f"{result['best_tracking_rank']:.2f}", flush=True)
     print("Best NLL:", f"{result['best_nll']:.4f}", flush=True)
     idinfo = result.get("identifiability", {})

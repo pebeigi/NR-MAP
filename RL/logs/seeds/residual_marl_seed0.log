@@ -1,0 +1,45 @@
+Using robust utility params from C:\Users\Pedram\NR-MAP\Calibration\utility_calibration.json
+Behavioral data term: band=0.10, shaping=0.50
+Utility-only baseline metric over 5 episodes: 2.000
+Update    1/400 | metric=   2.500 | best=   2.500 | collisions= 0.25 | realism=0.762 | loss=2555.210 | entropy= 2.135
+Update   10/400 | metric=   2.500 | best=   0.000 | collisions= 0.25 | realism=0.794 | loss=2522.945 | entropy= 2.896
+Update   20/400 | metric=   0.000 | best=   0.000 | collisions= 0.00 | realism=0.733 | loss=2417.262 | entropy= 3.170
+Update   30/400 | metric=  55.635 | best=   0.000 | collisions= 0.00 | realism=0.803 | loss=1857.120 | entropy= 3.466
+Update   40/400 | metric=   0.000 | best=   0.000 | collisions= 0.00 | realism=0.766 | loss=2396.893 | entropy= 3.726
+Update   50/400 | metric=   1.250 | best=   0.000 | collisions= 0.12 | realism=0.784 | loss=2082.624 | entropy= 4.044
+Update   60/400 | metric=   2.500 | best=   0.000 | collisions= 0.25 | realism=0.814 | loss=1479.389 | entropy= 4.479
+Update   70/400 | metric=   1.250 | best=   0.000 | collisions= 0.12 | realism=0.790 | loss=1443.732 | entropy= 4.729
+Update   80/400 | metric=   1.250 | best=   0.000 | collisions= 0.12 | realism=0.787 | loss=1392.589 | entropy= 4.949
+Update   90/400 | metric=   5.650 | best=   0.000 | collisions= 0.25 | realism=0.777 | loss=1377.531 | entropy= 5.247
+Update  100/400 | metric=   2.500 | best=   0.000 | collisions= 0.25 | realism=0.739 | loss=1199.306 | entropy= 5.502
+Update  110/400 | metric=   5.000 | best=   0.000 | collisions= 0.50 | realism=0.756 | loss=1052.520 | entropy= 5.762
+Update  120/400 | metric=   5.000 | best=   0.000 | collisions= 0.50 | realism=0.796 | loss=1027.153 | entropy= 6.016
+Update  130/400 | metric=   2.500 | best=   0.000 | collisions= 0.25 | realism=0.829 | loss= 769.990 | entropy= 6.249
+Update  140/400 | metric=   3.062 | best=   0.000 | collisions= 0.12 | realism=0.778 | loss= 730.255 | entropy= 6.469
+Update  150/400 | metric=   1.250 | best=   0.000 | collisions= 0.12 | realism=0.789 | loss= 547.458 | entropy= 6.709
+Update  160/400 | metric=   1.250 | best=   0.000 | collisions= 0.12 | realism=0.767 | loss= 597.865 | entropy= 6.868
+Update  170/400 | metric=   2.535 | best=   0.000 | collisions= 0.12 | realism=0.838 | loss= 817.160 | entropy= 7.030
+Update  180/400 | metric=  97.892 | best=   0.000 | collisions= 0.25 | realism=0.829 | loss= 687.009 | entropy= 7.202
+Update  190/400 | metric=  42.851 | best=   0.000 | collisions= 0.12 | realism=0.823 | loss= 695.300 | entropy= 7.442
+Update  200/400 | metric=  35.151 | best=   0.000 | collisions= 0.25 | realism=0.790 | loss= 721.417 | entropy= 7.669
+Update  210/400 | metric=   0.000 | best=   0.000 | collisions= 0.00 | realism=0.766 | loss= 339.297 | entropy= 7.875
+Update  220/400 | metric=   2.500 | best=   0.000 | collisions= 0.25 | realism=0.828 | loss= 629.844 | entropy= 8.127
+Update  230/400 | metric=   4.691 | best=   0.000 | collisions= 0.38 | realism=0.755 | loss= 330.567 | entropy= 8.362
+Update  240/400 | metric=   0.000 | best=   0.000 | collisions= 0.00 | realism=0.751 | loss= 364.217 | entropy= 8.553
+Update  250/400 | metric=   2.500 | best=   0.000 | collisions= 0.25 | realism=0.772 | loss= 469.953 | entropy= 8.777
+Update  260/400 | metric=   6.250 | best=   0.000 | collisions= 0.62 | realism=0.749 | loss= 288.345 | entropy= 9.009
+Update  270/400 | metric=   7.500 | best=   0.000 | collisions= 0.75 | realism=0.794 | loss= 855.409 | entropy= 9.176
+Update  280/400 | metric=  11.250 | best=   0.000 | collisions= 1.12 | realism=0.811 | loss= 427.914 | entropy= 9.414
+Update  290/400 | metric=   0.000 | best=   0.000 | collisions= 0.00 | realism=0.782 | loss= 566.764 | entropy= 9.539
+Update  300/400 | metric=  98.159 | best=   0.000 | collisions= 0.00 | realism=0.881 | loss= 873.506 | entropy= 9.788
+Update  310/400 | metric=   5.000 | best=   0.000 | collisions= 0.50 | realism=0.765 | loss= 416.616 | entropy=10.082
+Update  320/400 | metric=   1.250 | best=   0.000 | collisions= 0.12 | realism=0.729 | loss= 455.421 | entropy=10.301
+Update  330/400 | metric=   0.000 | best=   0.000 | collisions= 0.00 | realism=0.780 | loss= 321.597 | entropy=10.512
+Update  340/400 | metric=   4.105 | best=   0.000 | collisions= 0.25 | realism=0.793 | loss= 308.888 | entropy=10.717
+Update  350/400 | metric=   0.000 | best=   0.000 | collisions= 0.00 | realism=0.768 | loss= 421.479 | entropy=10.990
+Update  360/400 | metric=   3.490 | best=   0.000 | collisions= 0.25 | realism=0.802 | loss= 238.594 | entropy=11.304
+Update  370/400 | metric=   5.000 | best=   0.000 | collisions= 0.50 | realism=0.740 | loss= 256.664 | entropy=11.496
+Update  380/400 | metric=   3.351 | best=   0.000 | collisions= 0.00 | realism=0.806 | loss= 380.510 | entropy=11.856
+Update  390/400 | metric=   0.000 | best=   0.000 | collisions= 0.00 | realism=0.773 | loss= 431.372 | entropy=12.141
+Update  400/400 | metric=   2.752 | best=   0.000 | collisions= 0.12 | realism=0.812 | loss= 300.505 | entropy=12.384
+Saved PPO residual policy to RL\checkpoints\residual_policy_seed0.pt

@@ -1,5 +1,10 @@
 # Large raw datasets (GitHub 100 MB limit)
 data/Final_Lebanon_Data.csv
+data/Lebanon_Highway/Final_Lebanon_Data.csv
+data/Lebanon_Jounieh/Final_Jounieh.csv
+data/Lebanon_Jounieh/prepared/trajectories_calibration.csv
+data/TGSIM FB/*.csv
+data/TGSIM FB/prepared/trajectories_calibration.csv
 *.csv.gz
 *.h5
 *.hdf5

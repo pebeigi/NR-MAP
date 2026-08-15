@@ -185,37 +185,44 @@ class CorridorGeometry:
         return cls(center=center, cumulative_s=cumulative_s, tangents=tangents)
 
     def project(self, point: np.ndarray) -> tuple[float, float, np.ndarray]:
+        """Frenet coordinates of ``point``: station, signed lateral offset, tangent.
+
+        Vectorized over the candidate segment window; this runs once per candidate
+        action per agent per step and dominates closed-loop simulation cost.
+        """
         point = np.asarray(point, dtype=float)
         d2 = np.sum((self.center - point) ** 2, axis=1)
         i0 = int(np.argmin(d2))
         i_lo = max(0, i0 - 2)
         i_hi = min(len(self.center) - 2, i0 + 2)
-        best_dist = float("inf")
-        best_s = 0.0
-        best_lateral = 0.0
-        best_tangent = self.tangents[max(0, min(i0, len(self.tangents) - 1))]
-        for i in range(i_lo, i_hi + 1):
-            a = self.center[i]
-            b = self.center[i + 1]
-            ab = b - a
-            denom = float(ab @ ab) + 1e-12
-            t = float(np.clip(((point - a) @ ab) / denom, 0.0, 1.0))
-            q = a + t * ab
-            dist = float(np.linalg.norm(point - q))
-            if dist < best_dist:
-                tangent = self.tangents[i]
-                normal = np.array([-tangent[1], tangent[0]], dtype=float)
-                best_dist = dist
-                best_s = float(self.cumulative_s[i] + t * np.linalg.norm(ab))
-                best_lateral = float((point - q) @ normal)
-                best_tangent = tangent
-        return best_s, best_lateral, best_tangent
+
+        # Vectorized search over the window, then the winning segment is recomputed
+        # with the original scalar expressions so results stay bit-identical.
+        a_win = self.center[i_lo : i_hi + 1]
+        ab_win = self.center[i_lo + 1 : i_hi + 2] - a_win
+        pa_win = point - a_win
+        t_win = np.clip(
+            np.sum(pa_win * ab_win, axis=1) / (np.sum(ab_win * ab_win, axis=1) + 1e-12), 0.0, 1.0
+        )
+        rel_win = pa_win - t_win[:, None] * ab_win
+        i = i_lo + int(np.argmin(np.sum(rel_win * rel_win, axis=1)))
+
+        a = self.center[i]
+        ab = self.center[i + 1] - a
+        denom = float(ab @ ab) + 1e-12
+        t = float(np.clip(((point - a) @ ab) / denom, 0.0, 1.0))
+        q = a + t * ab
+        tangent = self.tangents[i]
+        normal = np.array([-tangent[1], tangent[0]], dtype=float)
+        best_s = float(self.cumulative_s[i] + t * np.linalg.norm(ab))
+        best_lateral = float((point - q) @ normal)
+        return best_s, best_lateral, tangent
 
 
 @lru_cache(maxsize=32)
 def corridor_geometry_for_run_lane(run_id: int, lane_kf: int) -> CorridorGeometry | None:
     try:
-        from data.highway_geometry import center_polyline, load_highway_boundaries
+        from data.Lebanon_Highway.highway_geometry import center_polyline, load_highway_boundaries
 
         load_highway_boundaries()
         center = center_polyline(run_id, lane_kf)
@@ -450,14 +457,26 @@ def candidate_obb_conflict(
     agent_idx: int,
     agents: list["TrafficAgent"],
     sim_config: dict[str, Any],
+    context: "AgentStepContext | None" = None,
 ) -> bool:
     """True if the candidate pose overlaps any constant-velocity neighbor OBB."""
-    from RL.corridor import boxes_overlap
+    from RL.corridor import boxes_overlap, boxes_overlap_any
 
     length, width = _vehicle_footprint(sim_config)
     cand_pos = np.asarray(candidate["pos"], dtype=float)
     cand_heading = float(candidate.get("heading", 0.0))
     dt = float(candidate.get("time_to_reach", sim_config.get("dt", 0.5)))
+
+    if (
+        context is not None
+        and context.neighbor_corners is not None
+        and context.neighbor_mu is not None
+        and abs(context.dt - dt) < 1e-12
+    ):
+        return boxes_overlap_any(
+            cand_pos, cand_heading, context.neighbor_corners, context.neighbor_mu, length, width
+        )
+
     for j, other in enumerate(agents):
         if j == agent_idx:
             continue
@@ -678,6 +697,82 @@ def generate_candidate_actions(
     return candidates
 
 
+@dataclass(frozen=True)
+class AgentStepContext:
+    """Quantities shared by every candidate action of one agent at one step.
+
+    The ego/reference projections and the car-following leader do not depend on the
+    candidate, so computing them per candidate repeated the same work 63 times.
+    """
+
+    corridor_geom: "CorridorGeometry | None"
+    tangent_at_ego: np.ndarray | None
+    ref_s: float
+    ref_n: float
+    lead_speed: float | None
+    # Neighbor poses predicted ``dt`` ahead, plus their oriented boxes. Valid only
+    # for candidates whose time_to_reach equals ``dt``.
+    dt: float = 0.0
+    neighbor_mu: np.ndarray | None = None
+    neighbor_corners: np.ndarray | None = None
+
+
+def build_step_context(
+    agent_idx: int,
+    agent: TrafficAgent,
+    agents: list[TrafficAgent],
+    sim_config: dict[str, Any],
+) -> AgentStepContext:
+    use_corridor = sim_config.get("utility_frame", "destination") == "corridor"
+    corridor_geom = None
+    if use_corridor and agent.run_id is not None and agent.lane_kf is not None:
+        corridor_geom = corridor_geometry_for_run_lane(int(agent.run_id), int(agent.lane_kf))
+
+    tangent_at_ego = None
+    ref_s = 0.0
+    ref_n = 0.0
+    if corridor_geom is not None:
+        _, _, tangent_at_ego = corridor_geom.project(agent.pos)
+        reference_pos = agent.utility_reference_pos
+        if reference_pos is None:
+            reference_pos = agent.dest
+        ref_s, ref_n, _ = corridor_geom.project(reference_pos)
+
+    lead_speed = find_leading_agent_speed(
+        agent_idx, agent, agents, sim_config, corridor_geom=corridor_geom
+    )
+
+    from RL.corridor import oriented_box_corners_batch
+
+    dt = float(sim_config.get("dt", 0.5))
+    length, width = _vehicle_footprint(sim_config)
+    others = [a for j, a in enumerate(agents) if j != agent_idx]
+    if others:
+        mu = np.array(
+            [np.asarray(o.pos, dtype=float) + np.asarray(o.vel, dtype=float) * dt for o in others],
+            dtype=float,
+        )
+        headings = np.array(
+            [float(o.heading_angle if o.heading_angle is not None else 0.0) for o in others],
+            dtype=float,
+        )
+        corners = oriented_box_corners_batch(mu, headings, length, width)
+    else:
+        mu = np.zeros((0, 2), dtype=float)
+        corners = np.zeros((0, 4, 2), dtype=float)
+
+    return AgentStepContext(
+        corridor_geom=corridor_geom,
+        tangent_at_ego=tangent_at_ego,
+        ref_s=float(ref_s),
+        ref_n=float(ref_n),
+        lead_speed=lead_speed,
+        dt=dt,
+        neighbor_mu=mu,
+        neighbor_corners=corners,
+    )
+
+
 def evaluate_candidate_utility(
     agent_idx: int,
     agent: TrafficAgent,
@@ -685,6 +780,7 @@ def evaluate_candidate_utility(
     agents: list[TrafficAgent],
     params: dict[str, float],
     sim_config: dict[str, Any],
+    context: AgentStepContext | None = None,
 ) -> float:
     """Total utility for one candidate action (Paper Eq. 4)."""
     cand_pos = candidate["pos"]
@@ -692,21 +788,16 @@ def evaluate_candidate_utility(
     cand_speed = float(candidate.get("speed", np.linalg.norm(cand_vel)))
     time_to_reach = candidate["time_to_reach"]
 
-    use_corridor = sim_config.get("utility_frame", "destination") == "corridor"
-    corridor_geom = None
-    if use_corridor and agent.run_id is not None and agent.lane_kf is not None:
-        corridor_geom = corridor_geometry_for_run_lane(int(agent.run_id), int(agent.lane_kf))
+    ctx = context if context is not None else build_step_context(agent_idx, agent, agents, sim_config)
+    corridor_geom = ctx.corridor_geom
 
     if corridor_geom is not None:
-        _, _, tangent_at_ego = corridor_geom.project(agent.pos)
-        util_dir = corridor_directional_alignment_utility(agent.pos, cand_pos, tangent_at_ego, params)
-        reference_pos = agent.utility_reference_pos
-        if reference_pos is None:
-            reference_pos = agent.dest
-        ref_s, ref_n, _ = corridor_geom.project(reference_pos)
+        util_dir = corridor_directional_alignment_utility(
+            agent.pos, cand_pos, ctx.tangent_at_ego, params
+        )
         cand_s, cand_n, _ = corridor_geom.project(cand_pos)
         util_dist = corridor_distance_reward_utility(
-            cand_s, cand_n, ref_s, ref_n, agent.speed, params, sim_config
+            cand_s, cand_n, ctx.ref_s, ctx.ref_n, agent.speed, params, sim_config
         )
     else:
         util_dir = directional_alignment_utility(
@@ -714,9 +805,7 @@ def evaluate_candidate_utility(
         )
         util_dist = distance_reward_utility(cand_pos, agent.dest, agent.speed, params, sim_config)
 
-    lead_speed = find_leading_agent_speed(
-        agent_idx, agent, agents, sim_config, corridor_geom=corridor_geom
-    )
+    lead_speed = ctx.lead_speed
     util_speed = speed_alignment_utility(
         cand_speed,
         lead_speed,
@@ -752,16 +841,19 @@ def select_best_candidate(
     candidate overlaps, fall back to the soft-utility maximizer (usually braking).
     """
     candidates = generate_candidate_actions(agent, sim_config["dt"], sim_config)
+    context = build_step_context(agent_idx, agent, agents, sim_config)
     best_free: dict[str, Any] | None = None
     best_free_u = -float("inf")
     best_any = candidates[0]
     best_any_u = -float("inf")
     for cand in candidates:
-        u = evaluate_candidate_utility(agent_idx, agent, cand, agents, params, sim_config)
+        u = evaluate_candidate_utility(
+            agent_idx, agent, cand, agents, params, sim_config, context=context
+        )
         if u > best_any_u:
             best_any_u = u
             best_any = cand
-        if candidate_obb_conflict(cand, agent_idx, agents, sim_config):
+        if candidate_obb_conflict(cand, agent_idx, agents, sim_config, context=context):
             continue
         if u > best_free_u:
             best_free_u = u

@@ -166,6 +166,55 @@ LABELS = {
 }
 
 
+# Models whose behavior depends on a training seed, with the checkpoint that a
+# single-seed run writes. Seeded runs append "_seed<k>" to the stem.
+LEARNED_CHECKPOINTS: dict[str, Path] = {
+    "residual_marl": Path("RL/checkpoints/residual_policy.pt"),
+    "residual_sigma_frozen": Path("RL/checkpoints/residual_policy.pt"),
+    "residual_collpen": Path("RL/checkpoints/residual_collpen_policy.pt"),
+    "residual_collpen_dense": Path("RL/checkpoints/residual_collpen_dense_policy.pt"),
+    "pure_rl": Path("Baselines/checkpoints/pure_rl_policy.pt"),
+    "pure_rl_safe": Path("Baselines/checkpoints/pure_rl_safe_policy.pt"),
+    "mappo": Path("Baselines/checkpoints/mappo_policy.pt"),
+    "happo": Path("Baselines/checkpoints/happo_policy.pt"),
+    "hatrpo": Path("Baselines/checkpoints/hatrpo_policy.pt"),
+}
+
+
+def is_learned(name: str) -> bool:
+    return name in LEARNED_CHECKPOINTS
+
+
+def seed_checkpoint(name: str, train_seed: int, base: Path | None = None) -> Path | None:
+    """Path a training run with ``train_seed`` writes for this model."""
+    root = base if base is not None else LEARNED_CHECKPOINTS.get(name)
+    if root is None:
+        return None
+    return root.with_name(f"{root.stem}_seed{int(train_seed)}{root.suffix}")
+
+
+def resolve_train_seeds(
+    name: str,
+    train_seeds: list[int] | None,
+    base: Path | None = None,
+) -> list[tuple[int, Path | None]]:
+    """(train_seed, checkpoint) pairs to evaluate for one model.
+
+    Falls back to the single-seed checkpoint when no per-seed files exist, so the
+    benchmark still runs before multi-seed training has been done.
+    """
+    if not train_seeds or not is_learned(name):
+        return [(-1, base)]
+    pairs = []
+    for s in train_seeds:
+        path = seed_checkpoint(name, s, base)
+        if path is not None and path.exists():
+            pairs.append((int(s), path))
+    if pairs:
+        return pairs
+    return [(-1, base)]
+
+
 def build_controller(name: str, **kwargs: Any) -> Controller:
     if name not in REGISTRY:
         raise KeyError(f"Unknown model '{name}'. Available: {sorted(REGISTRY)}")
@@ -178,8 +227,14 @@ def controller_kwargs(
     pure_rl_checkpoint: Path | None = None,
     calibration: Path | None = None,
     checkpoint_dir: Path | None = None,
+    checkpoint_override: Path | None = None,
 ) -> dict[str, Any]:
     """CLI-level wiring of checkpoints and calibration files."""
+    if checkpoint_override is not None and is_learned(name):
+        kwargs: dict[str, Any] = {"checkpoint": checkpoint_override}
+        if name.startswith("residual"):
+            kwargs["calibration"] = calibration
+        return kwargs
     if name in {"residual_marl", "residual_sigma_frozen"}:
         kwargs: dict[str, Any] = {"calibration": calibration}
         if residual_checkpoint is not None:

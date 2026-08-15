@@ -26,7 +26,8 @@ import pandas as pd
 import Baselines._paths  # noqa: F401
 from Baselines.metrics import aggregate, metrics_frame
 from Baselines.plots import plot_metric_bars, plot_trajectory_grid_frenet
-from Baselines.registry import LABELS, build_controller, controller_kwargs
+from Baselines.registry import LABELS, build_controller, controller_kwargs, resolve_train_seeds
+from Baselines.stats import comparison_frame, summary_frame
 from Baselines.runner import RolloutResult, rollout
 from Baselines.scenario import Scenario, build_scenario
 from RL.corridor import DEFAULT_LANE_KF, DEFAULT_RUN_ID
@@ -98,26 +99,55 @@ def _run_suite(
     )
 
     results: dict[str, list[RolloutResult]] = {}
+    train_seeds: dict[str, list[int]] = {}
     for model in models:
-        kwargs = controller_kwargs(
+        seed_pairs = resolve_train_seeds(
             model,
-            residual_checkpoint=args.residual_checkpoint,
-            calibration=args.calibration,
-            checkpoint_dir=args.checkpoint_dir,
+            getattr(args, "train_seeds", None),
+            base=args.residual_checkpoint if model.startswith("residual") else None,
         )
-        controller = build_controller(model, **kwargs)
-        model_results = [rollout(scenario, controller) for scenario in scenarios]
+        model_results: list[RolloutResult] = []
+        model_train_seeds: list[int] = []
+        for train_seed, checkpoint in seed_pairs:
+            kwargs = controller_kwargs(
+                model,
+                residual_checkpoint=args.residual_checkpoint,
+                calibration=args.calibration,
+                checkpoint_dir=args.checkpoint_dir,
+                checkpoint_override=checkpoint if train_seed >= 0 else None,
+            )
+            controller = build_controller(model, **kwargs)
+            for scenario in scenarios:
+                model_results.append(rollout(scenario, controller))
+                model_train_seeds.append(train_seed)
         results[model] = model_results
+        train_seeds[model] = model_train_seeds
         collisions = np.mean([r.collision_events for r in model_results])
         arrivals = np.mean([(r.arrival_step >= 0).mean() for r in model_results])
+        n_seeds = len({s for s in model_train_seeds if s >= 0})
+        seed_note = f" | {n_seeds} train seeds" if n_seeds > 1 else ""
         print(
             f"  {LABELS.get(model, model):<32} collisions={collisions:6.2f} | "
-            f"arrival={arrivals:5.2f}"
+            f"arrival={arrivals:5.2f}{seed_note}"
         )
 
     flat = [r for model_results in results.values() for r in model_results]
     frame = metrics_frame(flat)
+    frame["train_seed"] = [s for model in results for s in train_seeds[model]]
     frame.to_csv(output_dir / f"{label}_raw.csv", index=False)
+
+    stats_metrics = [
+        c
+        for c in ("collision_events", "offroad_rate", "min_ttc_s", "arrival_rate", "rms_jerk")
+        if c in frame.columns
+    ]
+    summary_frame(frame, stats_metrics, models=models).to_csv(
+        output_dir / f"{label}_stats.csv", index=False
+    )
+    if args.reference_model in models:
+        comparison_frame(
+            frame, stats_metrics, reference=args.reference_model, models=models
+        ).to_csv(output_dir / f"{label}_comparisons.csv", index=False)
     summary = aggregate(frame)
     summary.to_csv(output_dir / f"{label}_summary.csv", index=False)
 
@@ -157,6 +187,18 @@ def main() -> None:
     parser.add_argument("--models", nargs="+", default=ABLATION_MODELS)
     parser.add_argument("--scenarios", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--train-seeds",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Training seeds to evaluate for learned models; expects <stem>_seed<k>.pt checkpoints",
+    )
+    parser.add_argument(
+        "--reference-model",
+        default="residual_marl",
+        help="Model that paired comparisons are computed against",
+    )
     parser.add_argument("--num-agents", type=int, default=10, help="agents for standard ablation")
     parser.add_argument("--stress-agents", type=int, default=18, help="agents for dense stress")
     parser.add_argument("--max-steps", type=int, default=300)

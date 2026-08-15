@@ -1,0 +1,13 @@
+algo=mappo | actors=1 | obs_dim=31 | state_dim=91 | agents=10
+Update    1/200 | reward=-3555.067 | best=-3555.067 | collisions= 13.50 | arrived= 0.03 | critic=88428.875 | policy_loss=  0.002 | entropy= -0.361
+Update   20/200 | reward=-1732.888 | best=-1732.888 | collisions= 48.25 | arrived= 0.90 | critic=37461.555 | policy_loss=  0.071 | entropy= -0.392
+Update   40/200 | reward=   92.444 | best=  230.002 | collisions=195.25 | arrived= 1.00 | critic=5414.566 | policy_loss= -0.066 | entropy= -0.459
+Update   60/200 | reward=  909.773 | best=  917.936 | collisions=305.25 | arrived= 1.00 | critic=1279.710 | policy_loss=  0.011 | entropy= -0.525
+Update   80/200 | reward=  928.902 | best=  960.252 | collisions=296.75 | arrived= 1.00 | critic= 799.182 | policy_loss= -0.098 | entropy= -0.605
+Update  100/200 | reward=  950.944 | best=  960.252 | collisions=142.00 | arrived= 1.00 | critic= 204.458 | policy_loss= -0.019 | entropy= -0.658
+Update  120/200 | reward=  944.794 | best=  962.712 | collisions=211.50 | arrived= 1.00 | critic=  83.759 | policy_loss=  0.001 | entropy= -0.722
+Update  140/200 | reward=  959.783 | best=  965.896 | collisions=204.50 | arrived= 1.00 | critic=  52.472 | policy_loss=  0.130 | entropy= -0.817
+Update  160/200 | reward=  960.311 | best=  968.982 | collisions=143.75 | arrived= 1.00 | critic=  33.872 | policy_loss=  0.114 | entropy= -0.882
+Update  180/200 | reward=  963.721 | best=  968.982 | collisions=133.50 | arrived= 1.00 | critic=  14.316 | policy_loss=  0.013 | entropy= -0.973
+Update  200/200 | reward=  963.015 | best=  968.982 | collisions=133.25 | arrived= 1.00 | critic=  33.261 | policy_loss=  0.041 | entropy= -1.058
+Saved mappo policy to Baselines\checkpoints\mappo_policy_seed1.pt

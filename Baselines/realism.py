@@ -20,7 +20,7 @@ from Baselines._paths import REPO_ROOT
 from Baselines.runner import RolloutResult
 from RL.corridor import load_corridor
 
-DEFAULT_DATA_CSV = REPO_ROOT / "data" / "Final_Lebanon_Data.csv"
+DEFAULT_DATA_CSV = REPO_ROOT / "data" / "Lebanon_Highway" / "Final_Lebanon_Data.csv"
 FEATURES = ("speed", "accel", "lateral")
 
 

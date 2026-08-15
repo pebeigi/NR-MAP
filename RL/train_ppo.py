@@ -140,10 +140,11 @@ def collect_rollouts(
     env: MultiAgentTrafficEnv,
     policy: TorchResidualPolicy,
     episodes_per_update: int,
-) -> tuple[PPOMemory, list[float], list[int]]:
+) -> tuple[PPOMemory, list[float], list[int], list[float]]:
     memory = PPOMemory([], [], [], [], [], [])
     metrics: list[float] = []
     collisions: list[int] = []
+    realism: list[float] = []
 
     for _ in range(episodes_per_update):
         obs_list = env.reset()
@@ -160,15 +161,16 @@ def collect_rollouts(
                 memory.values.append(value)
                 step_transition_indices.append(len(memory.rewards))
 
-            obs_list, rewards, done, _ = env.step(residual_actions)
+            obs_list, rewards, done, info = env.step(residual_actions)
             for reward, _ in zip(rewards, step_transition_indices):
                 memory.rewards.append(float(reward))
                 memory.dones.append(float(done))
 
         metrics.append(env.rollout_metric())
         collisions.append(env.collision_count)
+        realism.append(float(info.get("realism_distance", float("nan"))))
 
-    return memory, metrics, collisions
+    return memory, metrics, collisions, realism
 
 
 def compute_gae(
@@ -257,6 +259,8 @@ def make_env(args: argparse.Namespace, seed: int) -> MultiAgentTrafficEnv:
         num_agents=args.num_agents,
         base_params=base_params,
         collision_penalty=float(getattr(args, "collision_penalty", 0.0)),
+        behavior_coef=float(getattr(args, "behavior_coef", 0.0)),
+        behavior_shaping_coef=float(getattr(args, "behavior_shaping_coef", 0.0)),
     )
     # Optional denser packing so collision-aware residuals see crowded traffic.
     if getattr(args, "dense_spawn", False):
@@ -295,13 +299,20 @@ def train(args: argparse.Namespace) -> None:
         print(f"Using {args.prefer_params} utility params from {args.calibration}")
     if args.collision_penalty > 0.0:
         print(f"OBB collision penalty = {args.collision_penalty:.2f} per colliding agent-step")
+    if args.behavior_coef > 0.0 or args.behavior_shaping_coef > 0.0:
+        print(
+            f"Behavioral data term: band={args.behavior_coef:.2f}, "
+            f"shaping={args.behavior_shaping_coef:.2f}"
+        )
     base = baseline_metric(args)
     print(f"Utility-only baseline metric over {args.baseline_episodes} episodes: {base:.3f}")
 
     best_metric = float("inf")
     for update in range(1, args.updates + 1):
         env = make_env(args, seed=args.seed + update * 1000)
-        memory, metrics, collisions = collect_rollouts(env, policy, args.episodes_per_update)
+        memory, metrics, collisions, realism = collect_rollouts(
+            env, policy, args.episodes_per_update
+        )
         stats = ppo_update(
             policy,
             optimizer,
@@ -319,9 +330,12 @@ def train(args: argparse.Namespace) -> None:
         best_metric = min(best_metric, mean_metric)
         log_every = args.log_every if args.log_every > 0 else max(min(args.updates // 10, 10), 1)
         if update == 1 or update % log_every == 0:
+            realism_note = ""
+            if np.any(np.isfinite(realism)):
+                realism_note = f" | realism={np.nanmean(realism):5.3f}"
             print(
                 f"Update {update:4d}/{args.updates} | metric={mean_metric:8.3f} | "
-                f"best={best_metric:8.3f} | collisions={np.mean(collisions):5.2f} | "
+                f"best={best_metric:8.3f} | collisions={np.mean(collisions):5.2f}{realism_note} | "
                 f"loss={stats['loss']:8.3f} | entropy={stats['entropy']:6.3f}"
             )
 
@@ -338,6 +352,8 @@ def train(args: argparse.Namespace) -> None:
                 "prefer_params": args.prefer_params,
                 "calibration": str(args.calibration) if args.calibration else None,
                 "collision_penalty": float(args.collision_penalty),
+                "behavior_coef": float(args.behavior_coef),
+                "behavior_shaping_coef": float(args.behavior_shaping_coef),
                 "updates": int(args.updates),
             },
             args.save,
@@ -389,6 +405,18 @@ def main() -> None:
         "--dense-spawn",
         action="store_true",
         help="Pack agents into a shorter spawn window (stress-like training distribution)",
+    )
+    parser.add_argument(
+        "--behavior-coef",
+        type=float,
+        default=0.0,
+        help="Weight of the dense out-of-band penalty on measured speed/accel/lateral marginals",
+    )
+    parser.add_argument(
+        "--behavior-shaping-coef",
+        type=float,
+        default=0.0,
+        help="Weight of potential-based shaping on the distance to the measured marginals",
     )
     parser.add_argument(
         "--log-every",

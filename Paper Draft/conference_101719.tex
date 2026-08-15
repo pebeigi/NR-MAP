@@ -30,7 +30,7 @@ Washington, DC, USA}
 
 Traffic in many developing regions operates under weak lane discipline, heterogeneous vehicle interactions, and decentralized negotiation of shared space. These environments challenge conventional lane-based trajectory prediction and motion planning frameworks, which typically rely on structured map priors and predefined leader--follower relationships. This paper presents a utility-guided residual multi-agent reinforcement learning framework for motion modeling in weakly structured non-lane-based traffic.
 
-The proposed approach combines an interpretable utility-based behavioral model with a residual multi-agent reinforcement learning policy. The utility model encodes directional preference, speed incentive, collision risk, and proximity-aware interaction terms derived from behavioral and economic decision-making principles. Rather than learning motion policies from scratch, the reinforcement learning layer adaptively modulates the utility-driven behavior through residual policy learning, enabling emergent negotiation and interaction behaviors while preserving physical interpretability and safety consistency.
+The proposed approach combines an interpretable utility-based behavioral model with a residual multi-agent reinforcement learning policy. The utility model encodes directional preference, speed incentive, collision risk, and proximity-aware interaction terms derived from behavioral and economic decision-making principles. Rather than learning motion policies from scratch, the reinforcement learning layer adaptively modulates the utility-driven behavior through residual policy learning, enabling emergent negotiation and interaction behaviors while preserving physical interpretability and safety consistency. The training reward includes a data term that matches the measured speed, acceleration, and lateral-offset distributions, so behavioral fidelity is optimized rather than only evaluated.
 
 The framework is evaluated on a weak-lane multilane freeway corridor reconstructed from high-resolution aerial trajectories collected in Lebanon. The proposed residual policy is benchmarked against classical continuous-space planners (ORCA, social force, DWA, MPPI), a calibrated utility prior, and a pure multi-agent RL baseline (MAPPO) under a shared simulation harness. Results show that residual learning improves the calibrated prior---especially under dense stress---while retaining human-like speed and acceleration statistics that pure RL tends to sacrifice for arrival efficiency.
 
@@ -65,7 +65,7 @@ Beyond reproducing vehicle kinematics, weak-lane and chaotic driving reflect asy
 The contributions of this study are:
 \begin{itemize}
     \item Calibration of a twelve-parameter utility prior (including vehicle-scale collision-kernel widths) on Lebanon freeway aerial trajectories, with robust working parameters for downstream simulation.
-    \item A utility-guided residual MARL policy that learns nine-dimensional parameter adjustments $\Delta\Theta$ (including $\Delta\sigma_{\parallel},\Delta\sigma_{\perp}$) rather than raw controls, preserving interpretability under bicycle kinematics.
+    \item A utility-guided residual MARL policy that learns nine-dimensional parameter adjustments $\Delta\Theta$ (including $\Delta\sigma_{\parallel},\Delta\sigma_{\perp}$) rather than raw controls, preserving interpretability under bicycle kinematics, and trained with a behavioral data term that aligns the reward with the measured motion distributions.
     \item A matched-seed closed-loop benchmark on the freeway corridor comparing residual MARL to ORCA, social force, DWA, MPPI, MAPPO, and the frozen utility prior, with ablations and a dense stress protocol.
     \item Evidence that residual adaptation improves prior safety under density and retains realism relative to pure MARL, while classical planners remain strongest on sparse collision counts.
 \end{itemize}
@@ -381,9 +381,9 @@ The policy adapts both the magnitude and sensitivity of selected utility compone
 The remaining utility parameters $(w_{x},w_{y},\beta)$ are treated as fixed geometric/shape priors in the current implementation. Residual actions are bounded (tanh-scaled per coordinate) and clipped to keep $\Theta_{i}^{t}$ within physically valid ranges.
 
 \subsection{Reward Function}
-The residual policy is trained with a multi-objective reward balancing progress, safety, control smoothness, and boundary feasibility:
+The residual policy is trained with a multi-objective reward balancing progress, safety, control smoothness, boundary feasibility, and agreement with measured behavioral statistics:
 \begin{equation}
-R_{i}=w_{1}R_{\mathrm{progress}}+w_{2}R_{\mathrm{safety}}+w_{3}R_{\mathrm{smooth}}+R_{\mathrm{boundary}}
+R_{i}=w_{1}R_{\mathrm{progress}}+w_{2}R_{\mathrm{safety}}+w_{3}R_{\mathrm{smooth}}+R_{\mathrm{boundary}}+w_{4}R_{\mathrm{behav}}
 \end{equation}
 
 The individual terms are
@@ -410,7 +410,34 @@ R_{\mathrm{boundary}}
 0, & \text{otherwise},
 \end{cases}
 \end{equation}
-where $a_{i}$ and $\delta_{i}$ are the executed bicycle controls, $\lambda_{\delta}$ weights steering cost, $C_{\mathrm{out}}>0$ is a base off-corridor penalty that exceeds the largest per-step progress reward, $d_{\mathrm{out}}$ is the penetration depth beyond the corridor edge, and $c_{\mathrm{depth}}$ provides a capped inward gradient ($d_{\max}$ prevents return-scale blow-up for untrained policies). An optional trajectory-matching term may be included when ground-truth imitation targets are available; in the present experiments it is set to zero.
+where $a_{i}$ and $\delta_{i}$ are the executed bicycle controls, $\lambda_{\delta}$ weights steering cost, $C_{\mathrm{out}}>0$ is a base off-corridor penalty that exceeds the largest per-step progress reward, $d_{\mathrm{out}}$ is the penetration depth beyond the corridor edge, and $c_{\mathrm{depth}}$ provides a capped inward gradient ($d_{\max}$ prevents return-scale blow-up for untrained policies).
+
+\subsubsection{Behavioral Data Term}
+Progress, safety, and smoothness alone do not encode human likeness, so a policy optimizing them can drift off the measured behavioral distribution---as the pure-MARL baseline does in Section~\ref{sec:benchmark}. We therefore include a data term built from the same three marginals used by the reported realism metric: speed $v$, longitudinal acceleration $a$, and corridor-lateral offset $n$, estimated from the measured trajectories of the same corridor at the control interval. It has two parts.
+
+First, a per-agent support penalty discourages behavior outside the observed central band $[q^{f}_{\mathrm{lo}},q^{f}_{\mathrm{hi}}]$ (empirical $2.5$th/$97.5$th percentiles) of each feature $f$, normalized by the observed standard deviation $s_{f}$ and capped at $\kappa$:
+\begin{equation}
+R_{\mathrm{band}}
+=
+-\frac{1}{3}\sum_{f}
+\min\!\left(
+\frac{\mathrm{dist}\bigl(x_{f},[q^{f}_{\mathrm{lo}},q^{f}_{\mathrm{hi}}]\bigr)}{s_{f}},\,\kappa
+\right),
+\end{equation}
+which is exactly zero inside the observed band and therefore does not compress the within-band spread.
+
+Second, let $D_{t}$ denote the normalized distributional distance between the marginals realized in the episode up to step $t$ and the measured ones,
+\begin{equation}
+D_{t}=\frac{1}{3}\sum_{f}\frac{W_{1}\bigl(\hat{p}^{f}_{t},\,p^{f}_{\mathrm{data}}\bigr)}{s_{f}},
+\end{equation}
+with $W_{1}$ the $1$-Wasserstein distance. Since a single terminal penalty gives almost no learning signal over a $240$-step episode, $D_{t}$ is applied as potential-based shaping,
+\begin{equation}
+R_{\mathrm{behav}}
+=
+R_{\mathrm{band}}
+-\lambda_{D}\bigl(D_{t}-D_{t-1}\bigr),
+\end{equation}
+whose increments telescope to the episode-level distance. The shaping signal is shared across agents, whereas $R_{\mathrm{band}}$ is agent-specific. Because $D_{t}$ is the same quantity reported as the realism score, behavioral fidelity is optimized during training rather than only evaluated afterwards.
 
 \subsection{Training Procedure}
 The residual policy is trained under centralized training and decentralized execution (CTDE). Episodes are initialized from observed traffic states derived from drone-based trajectory data. At each step:
@@ -443,8 +470,8 @@ including the collision-kernel scales. These parameters are calibrated from the 
 Valid passenger-vehicle transitions with time step $\Delta t\in[0.05,0.2]$\,s yield $190{,}767$ usable state records. From this pool we draw $N_{\mathrm{s}}=2000$ one-step choice samples. At each sample, the ego agent is reconstructed in the corridor frame with neighboring vehicles inside a $60$\,m radius (at most six neighbors). Candidate controls are generated on the same acceleration--steering grid used in simulation
 (acceleration $\in\{-3,\ldots,3\}$\,m/s$^2$, steering $\in[-0.45,0.45]$\,rad), producing a discrete action set $\mathcal{A}$. The observed next state is matched to the nearest candidate (target index) for likelihood evaluation.
 
-\paragraph{Closed-loop windows.}
-Because one-step ranking alone under-constrains $\theta$, we additionally sample $N_{\mathrm{w}}=40$ short trajectory windows of horizon $H=8$ steps. From the observed initial state of each window, the utility model repeatedly selects $\arg\max_{a\in\mathcal{A}} U(a;\theta)$ and the simulated pose/speed/heading are compared with the recorded trajectory.
+\paragraph{Closed-loop windows and data splits.}
+Because one-step ranking alone under-constrains $\theta$, short-horizon closed-loop tracking is the primary calibration signal, and we therefore evaluate it under an explicit held-out protocol rather than in sample. Windows of horizon $H=8$ steps are drawn from the $368$ vehicle trajectories of the corridor. Windows starting at consecutive indices of one trajectory overlap almost entirely, so partitioning windows directly would leak calibration data into the evaluation sets; we instead split whole \emph{vehicles} into disjoint pools ($60/20/20\%$ of trajectories, i.e.\ $221/74/73$ vehicles) and sample windows within each pool. This gives $N_{\mathrm{w}}^{\mathrm{cal}}=300$ calibration, $N_{\mathrm{w}}^{\mathrm{val}}=100$ validation, and $N_{\mathrm{w}}^{\mathrm{test}}=100$ test windows. From the observed initial state of each window, the utility model repeatedly selects $\arg\max_{a\in\mathcal{A}} U(a;\theta)$ and the simulated pose/speed/heading are compared with the recorded trajectory. Calibration windows define $J(\theta)$; validation windows select the working parameter vector among fit-acceptable candidates; test windows are scored exactly once, for the selected vector only, so the reported closed-loop error is never used to fit or to choose $\theta$.
 
 \paragraph{Objective.}
 Calibration minimizes a weighted composite loss
@@ -468,6 +495,8 @@ Because $J(\theta)$ is non-convex and partially flat, we do not trust a single o
 J(\theta)\le J(\theta^\star)+\max\bigl(0.05,\,0.05\,|J(\theta^\star)|\bigr).
 \]
 If fewer than three trials satisfy this cutoff, the top ten scored trials are used instead. The \emph{robust} working point $\theta_{\mathrm{rob}}$ is the coordinate-wise median of that cloud. This aggregation reduces sensitivity to isolated lucky minima while retaining the same predictive performance up to a small objective gap. Quantiles of the top/near-optimal clouds supply recommended ranges for subsequent global sensitivity analysis.
+
+Because the calibration objective is flat, choosing between $\theta^\star$ and $\theta_{\mathrm{rob}}$ on the calibration windows themselves would be uninformative. We therefore score both on the validation windows and adopt the lower-error vector as the working prior $\Theta_{\mathrm{base}}$. Scoring the ten best calibration trials on the same validation windows additionally quantifies how much the choice of point \emph{inside} the near-optimal region matters out of sample.
 
 \begin{table}[t]
 \centering
@@ -540,7 +569,7 @@ Relative to $\theta^\star$, the robust set pulls extreme weights inward (notably
 Of $240$ closed-loop-scored trials, only a small subset lies near $J(\theta^\star)$; the near-optimal/top cloud still exhibits large coefficient-of-variation across most coordinates (Fig.~\ref{fig:calibration_identifiability}). The strongest tradeoff is between $S_v$ and $\gamma$ (correlation $-0.85$), with additional coupling among $(S_\theta,S_v)$, $(w_x,w_c)$, and $(w_c,w_\ell)$. Thus the data identify a \emph{region} of acceptable utility weights more reliably than a unique point estimate.
 
 \paragraph{Implications.}
-For the remainder of this paper we (i)~fix $\theta_{\mathrm{rob}}$ as the nominal utility prior, (ii)~use the reported percentile ranges as bounds for global sensitivity analysis, and (iii)~interpret residual policy learning as refining behavior within an already plausible, but non-unique, utility basin.
+For the remainder of this paper we (i)~fix $\theta_{\mathrm{rob}}$ as the nominal utility prior, (ii)~use the reported percentile ranges as bounds for global sensitivity analysis, and (iii)~interpret residual policy learning as refining behavior within an already plausible, but non-unique, utility basin. We stress that $\theta_{\mathrm{rob}}$ is a \emph{robust working point} chosen for downstream stability, not a claim that the data recover a unique behavioral parameter vector: the residual policy is trained around one representative draw from the acceptable region. Learning residuals over the full posterior, $\theta_{i}\sim p(\theta\mid\mathcal{D})$ followed by $\theta_{i}'=\mathrm{clip}(\theta_{i}+\Delta\theta_{i})$, would turn this non-identifiability into an uncertainty-aware method; we leave that extension to future work and quantify its absence in Section~\ref{sec:limitations}.
 
 \begin{table*}[!t]
 \centering
@@ -572,7 +601,7 @@ $\sigma_{\perp}$ (m) & $1.972$ & $1.101$ & $1.357$ & $1.973$ \\
 All residual-learning and baseline comparisons use a shared closed-loop harness on the Lebanon freeway corridor (\texttt{run\_id}$=2$, lane Kalman filter branch $1$). Agents are integrated with the kinematic bicycle model, collisions are detected with oriented bounding boxes (OBBs), and corridor feasibility is enforced in Frenet coordinates. Scenario seeds, spawn windows, and episode lengths are matched across models so that differences reflect controllers rather than initialization.
 
 \paragraph{Residual training.}
-The utility prior is frozen at the robust calibrated vector $\Theta_{\mathrm{base}}=\theta_{\mathrm{rob}}$ (Table~\ref{tab:utility_calibration_params}). A shared-policy PPO residual agent outputs the nine-dimensional $\Delta\Theta$ defined above (including collision-kernel scales $(\Delta\sigma_{\parallel},\Delta\sigma_{\perp})$). Observations are fully decentralized (ego kinematics, corridor clearances, and a fixed nearest-neighbor budget). Rewards follow Eqs.~\eqref{eq:R_progress}--\eqref{eq:R_boundary}, with a depth-capped off-road penalty that prevents progress-driven corridor cutting. Unless noted, residual checkpoints are trained under the sparse protocol below.
+The utility prior is frozen at the robust calibrated vector $\Theta_{\mathrm{base}}=\theta_{\mathrm{rob}}$ (Table~\ref{tab:utility_calibration_params}). A shared-policy PPO residual agent outputs the nine-dimensional $\Delta\Theta$ defined above (including collision-kernel scales $(\Delta\sigma_{\parallel},\Delta\sigma_{\perp})$). Observations are fully decentralized (ego kinematics, corridor clearances, and a fixed nearest-neighbor budget). Rewards follow Eqs.~\eqref{eq:R_progress}--\eqref{eq:R_boundary}, with a depth-capped off-road penalty that prevents progress-driven corridor cutting, plus the behavioral data term $R_{\mathrm{behav}}$ so that the measured speed/acceleration/lateral marginals enter training and not only evaluation. Unless noted, residual checkpoints are trained under the sparse protocol below.
 
 \paragraph{Benchmark models.}
 The paper-facing comparison set is: ORCA, social force, dynamic window approach (DWA), model-predictive path-integral control (MPPI), MAPPO (pure MARL without a utility prior), the calibrated utility prior, and residual MARL. A Frenet lattice planner and alternative MARL variants (IPPO, HAPPO, HATRPO) were exercised in the same harness; they are omitted from the main table because of poor arrival/safety trade-offs or reward pathologies (high off-road rates / unstable returns), and are noted only as negative controls.
@@ -581,7 +610,12 @@ The paper-facing comparison set is: ORCA, social force, dynamic window approach 
 We report mean collision events per episode, off-road rate, arrival rate, travel time, RMS jerk, and a realism score defined as the mean 1-D Wasserstein distance between simulated and measured marginals of speed, longitudinal acceleration, and lateral offset (lower is more human-like). Minimum TTC and related safety auxiliaries are logged but not emphasized in the main table.
 
 \paragraph{Protocols.}
-\emph{Sparse (main):} $10$ scenarios $\times$ $10$ agents with the default spawn window. \emph{Ablation:} the same seeds comparing the prior, residual MARL, a $\sigma$-frozen residual (kernel scales clamped to $\Theta_{\mathrm{base}}$), a sparse collision-penalty residual variant, and MAPPO. \emph{Dense stress:} $18$ agents with a tighter spawn window on the same corridor geometry, stressing negotiation density.
+\emph{Sparse (main):} $N_{\mathrm{sc}}$ scenarios $\times$ $10$ agents with the default spawn window. \emph{Ablation:} the same seeds comparing the prior, residual MARL, a $\sigma$-frozen residual (kernel scales clamped to $\Theta_{\mathrm{base}}$), a sparse collision-penalty residual variant, and MAPPO. \emph{Dense stress:} $18$ agents with a tighter spawn window on the same corridor geometry, stressing negotiation density.
+
+\paragraph{Training seeds and uncertainty.}
+Two distinct sources of randomness affect a learned controller: scenario sampling and policy training. Reporting only scenario variation treats the trained policy as fixed and would make a gap between two learned models indistinguishable from PPO seed noise. We therefore train every learned model (residual MARL, its ablated variants, and MAPPO) with $K$ independent PPO seeds under identical hyperparameters, and evaluate every checkpoint on the same matched scenario set. Summaries for learned models use the \emph{training seed} as the resampling unit: scenario means are formed within a seed first, then aggregated across seeds, so a model gains no apparent precision from being evaluated on more scenarios. Reported intervals are $95\%$ percentile-bootstrap confidence intervals of the mean, and untrained controllers (ORCA, social force, DWA, MPPI, utility prior) are summarized over scenarios since they have no training randomness.
+
+Model-vs-model claims use scenarios as matched pairs, which is valid because all controllers see byte-identical initial conditions for a given scenario seed. The resampling is hierarchical: training seeds are drawn with replacement within each model while the scenario draw is shared between the two models, preserving the pairing. We report the mean paired difference with its bootstrap interval and call a difference significant only when that interval excludes zero. A scenario-level signed-rank test on seed-averaged scores is logged for reference but not used for claims, since it holds the trained policy fixed and is anticonservative for learned models.
 
 \section{Residual MARL Results}
 \label{sec:residual_results}
@@ -647,7 +681,14 @@ Overall, the benchmark supports a three-way trade-off: (i)~geometric planners le
 We presented a utility-guided residual MARL framework for decentralized motion on a weak-lane freeway corridor. After calibrating a twelve-parameter prospect-theoretic prior with vehicle-scale collision kernels, a shared residual policy learns nine-dimensional parameter adjustments---including kernel scales---rather than raw controls. On matched closed-loop seeds, residual learning modestly improves sparse collisions relative to the prior and yields a large dense-stress gain ($-20.4$ collisions), while freezing $\Delta\sigma$ erases that benefit. Against classical planners and MAPPO, residual MARL occupies a middle ground: it does not match ORCA/social-force sparse safety, but it preserves human-like kinematics that pure MARL sacrifices and surpasses MAPPO on dense collisions. These results support residual utility adaptation as a practical route to context-dependent negotiation without abandoning interpretable behavioral structure.
 
 \section{Limitations}
+\label{sec:limitations}
 In calibration, although the calibrated utility prior provides a usable working point for residual learning, several limitations should be noted. First, the twelve-dimensional utility parameter vector is only weakly identified: multiple substantially different parameter combinations attain nearly the same closed-loop objective, with strong tradeoffs such as that between \(S_v\) and \(\gamma\). Consequently, the calibration identifies a region of acceptable behavior rather than a unique optimum, which is why we report a robust median of near-optimal trials together with percentile ranges instead of relying on a single best vector. Second, one-step ranking remains imperfect on the discrete candidate grid---the observed-like action is frequently competitive (median rank near eight; top-ten hit rate about \(63\%\)) but is rarely selected as the unique maximizer---so the one-step likelihood alone under-constrains the parameters and must be complemented by short-horizon closed-loop tracking. Third, per-vehicle local fits exhibit wide dispersion, indicating residual heterogeneity that a single population prior cannot fully capture. Finally, global sensitivity conclusions are meaningful only when Sobol ranges are aligned with the calibrated uncertainty region; using substantially narrower ad-hoc bounds can understate (or misattribute) parameter influence relative to the operating regime used downstream.
+
+\paragraph{Point prior versus posterior.}
+The calibration establishes a region of acceptable utility parameters, but residual learning is carried out around the single robust vector $\theta_{\mathrm{rob}}$. The method is therefore not uncertainty-aware in its current form: agent heterogeneity is expressed only through the state-dependent residual $\Delta\Theta(o_{i})$, not through dispersion in the behavioral prior itself. Sampling $\theta_{i}\sim p(\theta\mid\mathcal{D})$ per agent (or per episode) and requiring the residual to improve behavior across draws is the natural next step, and would also test whether the reported gains survive prior misspecification within the identified region.
+
+\paragraph{Scope of the behavioral objective.}
+The behavioral data term constrains three scalar marginals (speed, longitudinal acceleration, lateral offset) through a support penalty and potential-based shaping on a distributional distance. It is a distribution-matching regularizer, not a trajectory-likelihood or adversarial imitation objective: it does not constrain temporal correlation, interaction-conditional response (for example gap acceptance as a function of relative speed), or joint occupancy structure. Consequently ``behavioral realism'' in this paper means agreement of these marginals with the measured corridor, and much of the remaining human likeness is inherited from the calibrated utility prior rather than learned from data by the policy.
 
 \paragraph{Residual learning and benchmarking.}
 Closed-loop residual and baseline evaluations are freeway-only; roundabout transfer is left for future work. Even with kernel adaptation, residual MARL still trails classical geometric planners on sparse collision counts. Alternative MARL algorithms (IPPO, HAPPO, HATRPO) exhibited reward hacking or unstable returns in this harness and are not competitive paper baselines. Dense collision-penalty residual training was not completed for this draft, so the collpen variant is reported only under the sparse ablation.

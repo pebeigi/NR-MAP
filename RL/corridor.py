@@ -18,7 +18,11 @@ from RL._paths import REPO_ROOT
 DEFAULT_RUN_ID = 2
 DEFAULT_LANE_KF = 1
 DEFAULT_BOUNDARY_CSV = (
-    REPO_ROOT / "data" / "derived_highway_boundaries" / "highway_boundaries.csv"
+    REPO_ROOT
+    / "data"
+    / "Lebanon_Highway"
+    / "derived_highway_boundaries"
+    / "highway_boundaries.csv"
 )
 
 # Passenger-car footprint used for OBB collisions / drawing.
@@ -69,28 +73,31 @@ class HighwayCorridor:
         i_lo = max(0, i0 - 2)
         i_hi = min(len(self.center) - 2, i0 + 2)
 
-        best_dist = float("inf")
-        best = (0.0, 0.0, self.tangents[max(0, min(i0, len(self.tangents) - 1))], i_lo, 0.0)
-        for i in range(i_lo, i_hi + 1):
-            a = self.center[i]
-            b = self.center[i + 1]
-            ab = b - a
-            denom = float(ab @ ab) + 1e-12
-            t = float(np.clip(((point - a) @ ab) / denom, 0.0, 1.0))
-            q = a + t * ab
-            dist = float(np.linalg.norm(point - q))
-            if dist < best_dist:
-                tangent = self.tangents[i]
-                normal = np.array([-tangent[1], tangent[0]], dtype=float)
-                best_dist = dist
-                best = (
-                    float(self.cumulative_s[i] + t * np.linalg.norm(ab)),
-                    float((point - q) @ normal),
-                    tangent,
-                    i,
-                    t,
-                )
-        return best
+        # Vectorized search over the window, then the winning segment is recomputed
+        # with the original scalar expressions so results stay bit-identical.
+        a_win = self.center[i_lo : i_hi + 1]
+        ab_win = self.center[i_lo + 1 : i_hi + 2] - a_win
+        pa_win = point - a_win
+        t_win = np.clip(
+            np.sum(pa_win * ab_win, axis=1) / (np.sum(ab_win * ab_win, axis=1) + 1e-12), 0.0, 1.0
+        )
+        rel_win = pa_win - t_win[:, None] * ab_win
+        i = i_lo + int(np.argmin(np.sum(rel_win * rel_win, axis=1)))
+
+        a = self.center[i]
+        ab = self.center[i + 1] - a
+        denom = float(ab @ ab) + 1e-12
+        t = float(np.clip(((point - a) @ ab) / denom, 0.0, 1.0))
+        q = a + t * ab
+        tangent = self.tangents[i]
+        normal = np.array([-tangent[1], tangent[0]], dtype=float)
+        return (
+            float(self.cumulative_s[i] + t * np.linalg.norm(ab)),
+            float((point - q) @ normal),
+            tangent,
+            i,
+            t,
+        )
 
     def edge_points_at(self, seg_i: int, t: float) -> tuple[np.ndarray, np.ndarray]:
         t = float(np.clip(t, 0.0, 1.0))
@@ -200,6 +207,66 @@ def oriented_box_corners(
     )
     rot = np.array([[c, -s], [s, c]], dtype=float)
     return np.asarray(pos, dtype=float) + local @ rot.T
+
+
+def oriented_box_corners_batch(
+    positions: np.ndarray,
+    headings: np.ndarray,
+    length: float = DEFAULT_VEHICLE_LENGTH,
+    width: float = DEFAULT_VEHICLE_WIDTH,
+) -> np.ndarray:
+    """Corners for many boxes at once: (m, 4, 2), same ordering as the scalar version."""
+    positions = np.atleast_2d(np.asarray(positions, dtype=float))
+    headings = np.atleast_1d(np.asarray(headings, dtype=float))
+    hx, hy = 0.5 * length, 0.5 * width
+    local = np.array([[hx, hy], [hx, -hy], [-hx, -hy], [-hx, hy]], dtype=float)
+    c = np.cos(headings)
+    s = np.sin(headings)
+    # rot.T per box, applied as local @ rot.T
+    rot_t = np.stack([np.stack([c, s], axis=-1), np.stack([-s, c], axis=-1)], axis=1)
+    return positions[:, None, :] + np.einsum("kj,mjl->mkl", local, rot_t)
+
+
+def boxes_overlap_any(
+    pos_a: np.ndarray,
+    heading_a: float,
+    corners_b: np.ndarray,
+    positions_b: np.ndarray,
+    length: float = DEFAULT_VEHICLE_LENGTH,
+    width: float = DEFAULT_VEHICLE_WIDTH,
+) -> bool:
+    """True if box A overlaps any of the pre-built boxes in ``corners_b``.
+
+    Same separating-axis test as :func:`boxes_overlap`, evaluated for all
+    candidates at once. Boxes farther apart than the circumscribed diameter are
+    rejected first, which cannot change the result.
+    """
+    corners_b = np.asarray(corners_b, dtype=float)
+    if corners_b.size == 0:
+        return False
+    pos_a = np.asarray(pos_a, dtype=float)
+    positions_b = np.atleast_2d(np.asarray(positions_b, dtype=float))
+
+    diameter = float(np.hypot(length, width))
+    offset = positions_b - pos_a
+    near = np.einsum("ij,ij->i", offset, offset) <= diameter * diameter
+    if not near.any():
+        return False
+    cb = corners_b[near]
+
+    ca = oriented_box_corners(pos_a, heading_a, length, width)
+    separated = np.zeros(len(cb), dtype=bool)
+    for axis in (ca[0] - ca[1], ca[1] - ca[2]):
+        unit = axis / (float(np.linalg.norm(axis)) + 1e-12)
+        proj_a = ca @ unit
+        proj_b = cb @ unit
+        separated |= (proj_a.max() < proj_b.min(axis=1)) | (proj_b.max(axis=1) < proj_a.min())
+    for axis in (cb[:, 0] - cb[:, 1], cb[:, 1] - cb[:, 2]):
+        unit = axis / (np.linalg.norm(axis, axis=1)[:, None] + 1e-12)
+        proj_a = ca @ unit.T  # (4, m)
+        proj_b = np.einsum("mij,mj->mi", cb, unit)
+        separated |= (proj_a.max(axis=0) < proj_b.min(axis=1)) | (proj_b.max(axis=1) < proj_a.min(axis=0))
+    return bool((~separated).any())
 
 
 def _axis_separate(corners_a: np.ndarray, corners_b: np.ndarray, axis: np.ndarray) -> bool:

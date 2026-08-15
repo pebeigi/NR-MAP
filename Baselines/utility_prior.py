@@ -18,6 +18,7 @@ from Baselines.controllers import BaseController
 from RL.calibration_io import load_base_params
 from utility_model import (
     TrafficAgent,
+    build_step_context,
     evaluate_candidate_utility,
     generate_candidate_actions,
     select_best_candidate,
@@ -55,9 +56,12 @@ class UtilityPriorController(BaseController):
         scenario: "Scenario",
     ) -> tuple[float, float]:
         candidates = generate_candidate_actions(agent, scenario.dt, scenario.sim_config)
+        context = build_step_context(idx, agent, agents, scenario.sim_config)
         utilities = np.array(
             [
-                evaluate_candidate_utility(idx, agent, c, agents, self.params, scenario.sim_config)
+                evaluate_candidate_utility(
+                    idx, agent, c, agents, self.params, scenario.sim_config, context=context
+                )
                 for c in candidates
             ],
             dtype=float,
