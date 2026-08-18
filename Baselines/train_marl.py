@@ -529,6 +529,8 @@ def train(args: argparse.Namespace) -> None:
     )
 
     best_reward = -float("inf")
+    best_collisions = float("inf")
+    best_state = None
     for update in range(1, args.updates + 1):
         episodes = [
             collect_episode(
@@ -561,7 +563,15 @@ def train(args: argparse.Namespace) -> None:
         policy.state_norm.update(batch.states[batch.masks > 0])
 
         mean_reward = float(np.mean([e.stats["reward"] for e in episodes]))
-        best_reward = max(best_reward, mean_reward)
+        mean_collisions = float(np.mean([e.stats["collisions"] for e in episodes]))
+        if mean_collisions < best_collisions or (
+            mean_collisions == best_collisions and mean_reward >= best_reward
+        ):
+            best_collisions = mean_collisions
+            best_reward = mean_reward
+            best_state = {k: v.detach().cpu().clone() for k, v in policy.state_dict().items()}
+        else:
+            best_reward = max(best_reward, mean_reward)
         if update == 1 or update % max(args.log_every, 1) == 0:
             print(
                 f"Update {update:4d}/{args.updates} | reward={mean_reward:9.3f} | "
@@ -573,12 +583,23 @@ def train(args: argparse.Namespace) -> None:
             )
 
     if args.save is not None:
+        if best_state is not None:
+            policy.load_state_dict(best_state)
         save_marl_policy(
             policy,
             args.save,
-            extra={"run_id": args.run_id, "lane_kf": args.lane_kf, "updates": args.updates},
+            extra={
+                "run_id": args.run_id,
+                "lane_kf": args.lane_kf,
+                "updates": args.updates,
+                "obs": "frenet_body",
+                "best_train_collisions": best_collisions,
+            },
         )
-        print(f"Saved {args.algo} policy to {args.save}")
+        print(
+            f"Saved {args.algo} policy to {args.save} "
+            f"(best train collisions={best_collisions:.2f})"
+        )
 
 
 def main() -> None:

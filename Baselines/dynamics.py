@@ -13,6 +13,7 @@ import numpy as np
 
 import Baselines._paths  # noqa: F401
 from RL.corridor import boundary_reward
+from RL.obs import contact_safety_reward, local_observation
 from utility_model import TrafficAgent, kinematic_bicycle_rollout
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -57,29 +58,14 @@ def neighbors_of(agents: list[TrafficAgent], idx: int, scenario: "Scenario") -> 
 
 
 def observation(agents: list[TrafficAgent], idx: int, scenario: "Scenario") -> np.ndarray:
-    """[x, y, v, psi, psi_goal, clear_low, clear_up] + k * [dx, dy, dvx, dvy]."""
-    ego = agents[idx]
-    max_n = int(scenario.sim_config["max_neighbors"])
-    obs = np.zeros(7 + 4 * max_n, dtype=np.float32)
-    _, _, _, c_lo, c_hi = project_and_clearances(scenario.corridor, ego.pos)
-    obs[0] = ego.pos[0]
-    obs[1] = ego.pos[1]
-    obs[2] = ego.speed
-    obs[3] = ego.heading
-    obs[4] = ego.goal_heading
-    obs[5] = c_lo
-    obs[6] = c_hi
-    start = 7
-    for j in neighbors_of(agents, idx, scenario):
-        other = agents[j]
-        obs[start : start + 4] = [
-            other.pos[0] - ego.pos[0],
-            other.pos[1] - ego.pos[1],
-            other.vel[0] - ego.vel[0],
-            other.vel[1] - ego.vel[1],
-        ]
-        start += 4
-    return obs
+    """Frenet ego state plus body-frame neighbors (shared with residual training)."""
+    return local_observation(
+        agents[idx],
+        agents,
+        neighbors_of(agents, idx, scenario),
+        scenario.corridor,
+        int(scenario.sim_config["max_neighbors"]),
+    )
 
 
 def observation_dim(scenario: "Scenario") -> int:
@@ -105,10 +91,11 @@ def compute_reward(
     tangent_angle = float(np.arctan2(tangent[1], tangent[0]))
     r_progress = ego.speed * np.cos(ego.heading - tangent_angle)
 
+    length = float(scenario.sim_config.get("vehicle_length", 4.5))
     r_safety = 0.0
     for j in neighbors_of(agents, idx, scenario):
         d_ij = float(np.linalg.norm(agents[j].pos - ego.pos))
-        r_safety -= float(np.exp(-d_ij))
+        r_safety += contact_safety_reward(d_ij, length)
 
     accel, steering = control
     r_smooth = -(accel**2 + steering_weight * steering**2)

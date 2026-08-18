@@ -21,6 +21,7 @@ from RL.corridor import (
 )
 from RL.behavior_reference import FEATURES as BEHAVIOR_FEATURES
 from RL.behavior_reference import load_behavior_reference
+from RL.obs import contact_safety_reward, local_observation
 from utility_model import (
     DEFAULT_BASE_PARAMS,
     DEFAULT_SIM_CONFIG,
@@ -96,6 +97,10 @@ class EnvConfig:
                         0.3375,
                         0.45,
                     ],
+                    # Closed-loop only: 1-step OBB at dt=0.5 misses closing pairs.
+                    # Calibration leaves these unset (defaults to 1 x dt).
+                    "conflict_substeps": 4,
+                    "conflict_horizon": 1.5,
                     "steering_penalty_weight": 0.5,
                     "vehicle_length": self.vehicle_length,
                     "vehicle_width": self.vehicle_width,
@@ -222,29 +227,14 @@ class MultiAgentTrafficEnv:
         return [j for _, j in neighbors[:max_n]]
 
     def get_observation(self, agent_idx: int) -> np.ndarray:
-        """Local decentralized observation with corridor clearances."""
-        ego = self.agents[agent_idx]
-        c_lo, c_hi, _ = self.corridor.clearances(ego.pos)
-        obs = np.zeros(self.obs_dim, dtype=np.float32)
-        obs[0] = ego.pos[0]
-        obs[1] = ego.pos[1]
-        obs[2] = ego.speed
-        obs[3] = ego.heading
-        obs[4] = ego.goal_heading
-        obs[5] = c_lo
-        obs[6] = c_hi
-
-        start = 7
-        for j in self.get_neighbors(agent_idx):
-            other = self.agents[j]
-            obs[start : start + 4] = [
-                other.pos[0] - ego.pos[0],
-                other.pos[1] - ego.pos[1],
-                other.vel[0] - ego.vel[0],
-                other.vel[1] - ego.vel[1],
-            ]
-            start += 4
-        return obs
+        """Frenet ego state + body-frame neighbors (see ``RL.obs.local_observation``)."""
+        return local_observation(
+            self.agents[agent_idx],
+            self.agents,
+            self.get_neighbors(agent_idx),
+            self.corridor,
+            int(self.config.sim_config["max_neighbors"]),
+        )
 
     def _compute_reward(
         self,
@@ -262,10 +252,11 @@ class MultiAgentTrafficEnv:
         tangent_angle = float(np.arctan2(tangent[1], tangent[0]))
         r_progress = ego.speed * np.cos(ego.heading - tangent_angle)
 
+        length = float(sim.get("vehicle_length", self.config.vehicle_length))
         r_safety = 0.0
         for j in self.get_neighbors(agent_idx):
             d_ij = float(np.linalg.norm(self.agents[j].pos - ego.pos))
-            r_safety -= np.exp(-d_ij)
+            r_safety += contact_safety_reward(d_ij, length)
 
         if control is not None:
             a = float(control.get("accel", 0.0))

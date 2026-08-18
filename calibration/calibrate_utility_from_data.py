@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import dataclass
+from heapq import heappop, heappush
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -21,6 +22,9 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import shapely
+from shapely.geometry import Polygon
+from shapely.ops import unary_union
 
 import Calibration._paths  # noqa: F401 — repo root on sys.path
 from Calibration._paths import REPO_ROOT
@@ -68,6 +72,7 @@ class ChoiceSample:
     desired_speed: float
     target_index: int
     target_match_cost: float
+    path_mode: str = "boundary"
 
 
 @dataclass
@@ -122,6 +127,235 @@ def load_boundary_map(boundary_csv: Path | None) -> BoundaryMap:
         (int(run_id), int(lane_kf)): group.sort_values("point_index").reset_index(drop=True)
         for (run_id, lane_kf), group in df.groupby(["run_id", "lane_kf"], sort=True)
     }
+
+
+def _closed_xy(group: pd.DataFrame) -> np.ndarray:
+    xy = group.sort_values("vertex_index")[["x", "y"]].to_numpy(float)
+    if len(xy) and not np.allclose(xy[0], xy[-1]):
+        xy = np.vstack([xy, xy[0]])
+    return xy
+
+
+def load_site_roadway(path: Path | None):
+    """Closed roadway polygon from Jounieh (outer−islands) or TGSIM curb CSV."""
+    if path is None or not path.exists():
+        return None
+    df = pd.read_csv(path)
+    if {"kind", "polygon_id", "x", "y", "vertex_index"}.issubset(df.columns):
+        outers = []
+        holes = []
+        for (kind, pid), g in df.groupby(["kind", "polygon_id"], sort=True):
+            poly = Polygon(_closed_xy(g))
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if str(kind) == "outer":
+                outers.append(poly)
+            else:
+                holes.append(poly)
+        if not outers:
+            return None
+        road = unary_union(outers)
+        for hole in holes:
+            road = road.difference(hole)
+        return road if not road.is_empty else None
+    if {"x", "y", "part_index", "vertex_index"}.issubset(df.columns):
+        rings = [
+            _closed_xy(g)
+            for _, g in df.sort_values(["part_index", "vertex_index"]).groupby("part_index")
+        ]
+        if not rings:
+            return None
+        poly = Polygon(rings[0], rings[1:]) if len(rings) > 1 else Polygon(rings[0])
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        return poly if not poly.is_empty else None
+    return None
+
+
+def polygon_path_error(points: np.ndarray, roadway, boundary_buffer: float = 1.5) -> np.ndarray:
+    """Inside: near-edge cost in the last ``buffer`` m. Outside: distance + buffer."""
+    pts = np.atleast_2d(np.asarray(points, dtype=float))
+    if roadway is None or len(pts) == 0:
+        return np.zeros(len(pts), dtype=float)
+    geoms = shapely.points(pts)
+    d_edge = np.asarray(shapely.distance(geoms, roadway.boundary), dtype=float)
+    inside = np.asarray(shapely.contains(roadway, geoms), dtype=bool)
+    return np.where(inside, np.maximum(0.0, boundary_buffer - d_edge), d_edge + boundary_buffer)
+
+
+class OnRoadDestField:
+    """Geodesic-to-dest on a site polygon. Cached per destination cell."""
+
+    def __init__(self, roadway, cell: float | None = None):
+        self.roadway = roadway
+        minx, miny, maxx, maxy = roadway.bounds
+        span = max(maxx - minx, maxy - miny)
+        self.cell = float(cell if cell is not None else (1.0 if span < 80.0 else 2.0))
+        pad = 2.0 * self.cell
+        self.x0 = float(minx - pad)
+        self.y0 = float(miny - pad)
+        nx = int(np.ceil((maxx + pad - self.x0) / self.cell)) + 1
+        ny = int(np.ceil((maxy + pad - self.y0) / self.cell)) + 1
+        xs = self.x0 + self.cell * np.arange(nx)
+        ys = self.y0 + self.cell * np.arange(ny)
+        xx, yy = np.meshgrid(xs, ys)
+        pts = np.column_stack([xx.ravel(), yy.ravel()])
+        self.inside = np.asarray(shapely.contains(roadway, shapely.points(pts)), dtype=bool).reshape((ny, nx))
+        self.nx = nx
+        self.ny = ny
+        self._dist: dict[tuple[int, int], np.ndarray] = {}
+        offsets = [
+            (-1, 0, self.cell),
+            (1, 0, self.cell),
+            (0, -1, self.cell),
+            (0, 1, self.cell),
+            (-1, -1, self.cell * np.sqrt(2.0)),
+            (-1, 1, self.cell * np.sqrt(2.0)),
+            (1, -1, self.cell * np.sqrt(2.0)),
+            (1, 1, self.cell * np.sqrt(2.0)),
+        ]
+        self._nbrs = [(di, dj, float(c)) for di, dj, c in offsets if di or dj]
+
+    def _snap(self, xy: np.ndarray) -> tuple[int, int]:
+        j = int(np.clip(round((float(xy[0]) - self.x0) / self.cell), 0, self.nx - 1))
+        i = int(np.clip(round((float(xy[1]) - self.y0) / self.cell), 0, self.ny - 1))
+        if self.inside[i, j]:
+            return i, j
+        best = None
+        best_d = 1e18
+        for r in range(1, max(self.nx, self.ny)):
+            for di in range(-r, r + 1):
+                for dj in range(-r, r + 1):
+                    if max(abs(di), abs(dj)) != r:
+                        continue
+                    ni, nj = i + di, j + dj
+                    if 0 <= ni < self.ny and 0 <= nj < self.nx and self.inside[ni, nj]:
+                        d = di * di + dj * dj
+                        if d < best_d:
+                            best_d = d
+                            best = (ni, nj)
+            if best is not None:
+                return best
+        return i, j
+
+    def _field(self, dest: np.ndarray) -> np.ndarray:
+        key = self._snap(dest)
+        cached = self._dist.get(key)
+        if cached is not None:
+            return cached
+        inf = 1.0e9
+        dist = np.full((self.ny, self.nx), inf, dtype=float)
+        si, sj = key
+        if not self.inside[si, sj]:
+            self._dist[key] = dist
+            return dist
+        dist[si, sj] = 0.0
+        heap = [(0.0, si, sj)]
+        while heap:
+            d, i, j = heappop(heap)
+            if d > dist[i, j] + 1e-9:
+                continue
+            for di, dj, step in self._nbrs:
+                ni, nj = i + di, j + dj
+                if not (0 <= ni < self.ny and 0 <= nj < self.nx and self.inside[ni, nj]):
+                    continue
+                nd = d + step
+                if nd + 1e-9 < dist[ni, nj]:
+                    dist[ni, nj] = nd
+                    heappush(heap, (nd, ni, nj))
+        self._dist[key] = dist
+        return dist
+
+    def remaining_and_dir(self, points: np.ndarray, dest: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        pts = np.atleast_2d(np.asarray(points, dtype=float))
+        field = self._field(dest)
+        remaining = np.zeros(len(pts), dtype=float)
+        dest_dir = np.zeros((len(pts), 2), dtype=float)
+        geoms = shapely.points(pts)
+        d_edge = np.asarray(shapely.distance(geoms, self.roadway.boundary), dtype=float)
+        inside = np.asarray(shapely.contains(self.roadway, geoms), dtype=bool)
+        for k, xy in enumerate(pts):
+            i, j = self._snap(xy)
+            rem = float(field[i, j])
+            if not np.isfinite(rem) or rem >= 1.0e8:
+                rem = float(np.linalg.norm(np.asarray(dest, dtype=float) - xy)) + 50.0
+            remaining[k] = rem if inside[k] else rem + float(d_edge[k])
+            best = None
+            best_val = rem
+            for di, dj, _ in self._nbrs:
+                ni, nj = i + di, j + dj
+                if 0 <= ni < self.ny and 0 <= nj < self.nx and field[ni, nj] + 1e-9 < best_val:
+                    best_val = field[ni, nj]
+                    best = (di, dj)
+            if best is None:
+                vec = np.asarray(dest, dtype=float) - xy
+            else:
+                vec = np.array([best[1] * self.cell, best[0] * self.cell], dtype=float)
+            n = float(np.linalg.norm(vec))
+            dest_dir[k] = vec / n if n > 1e-6 else np.array([1.0, 0.0])
+        return remaining, dest_dir
+
+
+def destination_choice_features(
+    ego_pos: np.ndarray,
+    cand_pos: np.ndarray,
+    dest_pos: np.ndarray,
+    heading: float | None = None,
+    on_road: OnRoadDestField | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Dest alignment + remaining distance (Euclidean, or on-road geodesic if given)."""
+    ego_pos = np.asarray(ego_pos, dtype=float)
+    dest_pos = np.asarray(dest_pos, dtype=float)
+    move = cand_pos - ego_pos
+    move_norm = np.linalg.norm(move, axis=1)
+    if on_road is not None:
+        remaining, dest_dir = on_road.remaining_and_dir(cand_pos, dest_pos)
+        geoms = shapely.points(np.atleast_2d(cand_pos))
+        lat = np.asarray(shapely.distance(geoms, on_road.roadway.boundary), dtype=float)
+        inside = np.asarray(shapely.contains(on_road.roadway, geoms), dtype=bool)
+        lat = np.where(inside, 0.0, lat)
+        dest_norm = np.linalg.norm(dest_dir, axis=1)
+        dir_cos = np.ones(len(cand_pos), dtype=float)
+        valid = (move_norm > 1e-6) & (dest_norm > 1e-6)
+        dir_cos[valid] = np.einsum(
+            "ij,ij->i",
+            move[valid] / move_norm[valid, None],
+            dest_dir[valid],
+        )
+        stagnant = move_norm <= 1e-6
+        if np.any(stagnant) and heading is not None:
+            tangent = np.array([np.cos(heading), np.sin(heading)], dtype=float)
+            dir_cos[stagnant] = dest_dir[stagnant] @ tangent
+        dist_abs = np.column_stack([remaining, lat])
+        return dir_cos, dist_abs
+    dest_vec = dest_pos - cand_pos
+    dest_norm = np.linalg.norm(dest_vec, axis=1)
+    dir_cos = np.ones(len(cand_pos), dtype=float)
+    valid = (move_norm > 1e-6) & (dest_norm > 1e-6)
+    dir_cos[valid] = np.einsum(
+        "ij,ij->i",
+        move[valid] / move_norm[valid, None],
+        dest_vec[valid] / dest_norm[valid, None],
+    )
+    stagnant = (move_norm <= 1e-6) & (dest_norm > 1e-6)
+    if np.any(stagnant) and heading is not None:
+        dest_from_ego = dest_pos - ego_pos
+        n = float(np.linalg.norm(dest_from_ego))
+        if n > 1e-6:
+            tangent = np.array([np.cos(heading), np.sin(heading)], dtype=float)
+            dir_cos[stagnant] = float(tangent @ (dest_from_ego / n))
+    dist_abs = np.abs(cand_pos - dest_pos)
+    return dir_cos, dist_abs
+
+
+def heading_choice_features(
+    ego_pos: np.ndarray,
+    heading: float,
+    cand_pos: np.ndarray,
+    reference_pos: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Deprecated heading-frame features; kept for older result JSON replay."""
+    return destination_choice_features(ego_pos, cand_pos, reference_pos, heading=heading)
 
 
 def corridor_geometry_from_map(
@@ -283,7 +517,10 @@ def boundary_summary(df: pd.DataFrame) -> dict[str, Any]:
     return out
 
 
-def load_and_prepare(csv_path: Path, class_id: float | None) -> pd.DataFrame:
+def load_and_prepare(
+    csv_path: Path,
+    class_id: float | None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     cols = [
         "id",
         "time",
@@ -296,8 +533,6 @@ def load_and_prepare(csv_path: Path, class_id: float | None) -> pd.DataFrame:
         "run_id",
     ]
     df = pd.read_csv(csv_path, usecols=cols)
-    if class_id is not None:
-        df = df[df["class"] == class_id].copy()
     df = df.dropna(subset=["id", "time", "xloc_kf", "yloc_kf", "speed_kf", "run_id"])
     df = df.sort_values(["run_id", "id", "time"]).reset_index(drop=True)
     group = df.groupby(["run_id", "id"], sort=False)
@@ -307,23 +542,39 @@ def load_and_prepare(csv_path: Path, class_id: float | None) -> pd.DataFrame:
     df["final_x"] = group["xloc_kf"].transform("last")
     df["final_y"] = group["yloc_kf"].transform("last")
     df["nominal_y"] = group["yloc_kf"].transform("median")
-    df["desired_speed"] = group["speed_kf"].transform(lambda s: float(np.quantile(s, 0.85)))
+
+    def _desired(s: pd.Series) -> float:
+        moving = s[s.to_numpy(float) > 1.0]
+        src = moving if len(moving) >= 5 else s
+        return float(np.quantile(src.to_numpy(float), 0.85))
+
+    df["desired_speed"] = group["speed_kf"].transform(_desired)
 
     dx = df["next_xloc_kf"] - df["xloc_kf"]
     dy = df["next_yloc_kf"] - df["yloc_kf"]
     df["dt"] = df["next_time"] - df["time"]
-    df["heading"] = np.arctan2(dy, dx)
+    step = np.hypot(dx.to_numpy(float), dy.to_numpy(float))
+    heading = np.arctan2(dy.to_numpy(float), dx.to_numpy(float))
+    heading = np.where(step > 0.05, heading, np.nan)
+    df["heading"] = heading
+    df["heading"] = df.groupby(["run_id", "id"], sort=False)["heading"].transform(
+        lambda s: s.ffill().bfill()
+    )
     df["vx"] = df["speed_kf"] * np.cos(df["heading"])
     df["vy"] = df["speed_kf"] * np.sin(df["heading"])
 
-    valid = (
+    time_ok = (
         df["next_xloc_kf"].notna()
         & df["next_yloc_kf"].notna()
         & df["dt"].between(0.05, 0.2)
-        & (df["speed_kf"] > 0.5)
         & np.isfinite(df["heading"])
     )
-    return df[valid].copy()
+    scene = df[time_ok].copy()
+    ego = scene
+    if class_id is not None:
+        ego = ego[ego["class"] == class_id]
+    ego = ego[ego["speed_kf"] > 0.5].copy()
+    return ego, scene
 
 
 def make_agent(row: pd.Series, agent_id: int) -> TrafficAgent:
@@ -433,16 +684,26 @@ def build_choice_sample(
         + 0.5 * np.abs(angle_diff(cand_heading, actual_heading))
     )
     target_index = int(np.argmin(match_cost))
-
-    corridor = corridor_geometry_from_map(int(row["run_id"]), int(row["lane_kf"]), boundary_map)
     reference_pos = actual_next
-    dir_cos, dist_abs = corridor_choice_features(
-        ego.pos,
-        cand_pos,
-        reference_pos,
-        ego.dest,
-        corridor,
-    )
+
+    corridor = None
+    if sim_config.get("utility_frame") == "destination":
+        dir_cos, dist_abs = destination_choice_features(
+            ego.pos,
+            cand_pos,
+            ego.dest,
+            heading=float(ego.heading_angle),
+            on_road=sim_config.get("_on_road_dest"),
+        )
+    else:
+        corridor = corridor_geometry_from_map(int(row["run_id"]), int(row["lane_kf"]), boundary_map)
+        dir_cos, dist_abs = corridor_choice_features(
+            ego.pos,
+            cand_pos,
+            reference_pos,
+            ego.dest,
+            corridor,
+        )
 
     variances = np.array(sim_config["collision_pred_variances"], dtype=float)
     p_collision = collision_probability(
@@ -454,13 +715,21 @@ def build_choice_sample(
         vehicle_length=float(sim_config.get("vehicle_length", 4.5)),
         vehicle_width=float(sim_config.get("vehicle_width", 1.8)),
     )
-    path_error = boundary_path_error(
-        cand_pos,
-        run_id=int(row["run_id"]),
-        lane_kf=int(row["lane_kf"]),
-        boundary_map=boundary_map,
-        boundary_buffer=float(sim_config.get("boundary_buffer", 1.5)),
-    )
+    roadway = sim_config.get("_site_roadway")
+    if roadway is not None:
+        path_error = polygon_path_error(
+            cand_pos,
+            roadway,
+            boundary_buffer=float(sim_config.get("boundary_buffer", 1.5)),
+        )
+    else:
+        path_error = boundary_path_error(
+            cand_pos,
+            run_id=int(row["run_id"]),
+            lane_kf=int(row["lane_kf"]),
+            boundary_map=boundary_map,
+            boundary_buffer=float(sim_config.get("boundary_buffer", 1.5)),
+        )
     if not np.any(np.isfinite(path_error)) or np.allclose(path_error, 0.0):
         path_error = np.abs(cand_pos[:, 1] - float(row["nominal_y"]))
 
@@ -478,6 +747,7 @@ def build_choice_sample(
         desired_speed=float(row["desired_speed"]),
         target_index=target_index,
         target_match_cost=float(match_cost[target_index]),
+        path_mode=str(sim_config.get("path_mode", "boundary")),
     )
 
 
@@ -486,6 +756,7 @@ def sample_choices(
     args: argparse.Namespace,
     sim_config: dict[str, Any],
     boundary_map: BoundaryMap,
+    scene_df: pd.DataFrame | None = None,
 ) -> list[ChoiceSample]:
     rng = np.random.default_rng(args.seed)
     if len(df) > args.n_samples * 20:
@@ -493,7 +764,8 @@ def sample_choices(
     else:
         candidate_rows = df
 
-    grouped = {key: group for key, group in df.groupby(["run_id", "time"], sort=False)}
+    neighbor_src = scene_df if scene_df is not None else df
+    grouped = {key: group for key, group in neighbor_src.groupby(["run_id", "time"], sort=False)}
     samples: list[ChoiceSample] = []
     log_progress(
         f"Building up to {args.n_samples} choice samples from {len(candidate_rows)} candidate rows...",
@@ -535,7 +807,12 @@ def utility_values(sample: ChoiceSample, params: dict[str, float]) -> np.ndarray
     d_eff = params["w_x"] * sample.dist_abs[:, 0] + params["w_y"] * sample.dist_abs[:, 1]
     h_p = max(2.0 * sample.current_speed, 5.0)
     distance_term = 1.0 / (1.0 + (d_eff / h_p) ** params["gamma"])
-    path_penalty = 1.0 - np.exp(-params["beta"] * sample.path_error**2)
+    err = np.maximum(sample.path_error, 0.0)
+    if getattr(sample, "path_mode", "boundary") == "site_polygon":
+        cap = 1.5
+        path_penalty = 1.0 - np.exp(-params["beta"] * np.minimum(err, cap) ** 2) + np.maximum(0.0, err - cap)
+    else:
+        path_penalty = 1.0 - np.exp(-params["beta"] * err**2)
 
     return (
         params["S_theta"] * sample.dir_cos
@@ -565,14 +842,23 @@ def candidate_features_for_state(
         reference_pos = agent.utility_reference_pos
     if reference_pos is None:
         reference_pos = agent.dest
-    corridor = corridor_geometry_from_map(run_id, lane_kf, boundary_map)
-    dir_cos, dist_abs = corridor_choice_features(
-        agent.pos,
-        cand_pos,
-        np.asarray(reference_pos, dtype=float),
-        agent.dest,
-        corridor,
-    )
+    if sim_config.get("utility_frame") == "destination":
+        dir_cos, dist_abs = destination_choice_features(
+            agent.pos,
+            cand_pos,
+            np.asarray(agent.dest, dtype=float),
+            heading=float(agent.heading_angle),
+            on_road=sim_config.get("_on_road_dest"),
+        )
+    else:
+        corridor = corridor_geometry_from_map(run_id, lane_kf, boundary_map)
+        dir_cos, dist_abs = corridor_choice_features(
+            agent.pos,
+            cand_pos,
+            np.asarray(reference_pos, dtype=float),
+            agent.dest,
+            corridor,
+        )
 
     variances = collision_variances(params, sim_config)
     p_collision = collision_probability(
@@ -584,13 +870,21 @@ def candidate_features_for_state(
         vehicle_length=float(sim_config.get("vehicle_length", 4.5)),
         vehicle_width=float(sim_config.get("vehicle_width", 1.8)),
     )
-    path_error = boundary_path_error(
-        cand_pos,
-        run_id=run_id,
-        lane_kf=lane_kf,
-        boundary_map=boundary_map,
-        boundary_buffer=float(sim_config.get("boundary_buffer", 1.5)),
-    )
+    roadway = sim_config.get("_site_roadway")
+    if roadway is not None:
+        path_error = polygon_path_error(
+            cand_pos,
+            roadway,
+            boundary_buffer=float(sim_config.get("boundary_buffer", 1.5)),
+        )
+    else:
+        path_error = boundary_path_error(
+            cand_pos,
+            run_id=run_id,
+            lane_kf=lane_kf,
+            boundary_map=boundary_map,
+            boundary_buffer=float(sim_config.get("boundary_buffer", 1.5)),
+        )
     if not np.any(np.isfinite(path_error)) or np.allclose(path_error, 0.0):
         path_error = np.abs(cand_pos[:, 1] - float(agent.nominal_y))
 
@@ -608,6 +902,7 @@ def candidate_features_for_state(
         desired_speed=agent.desired_speed,
         target_index=0,
         target_match_cost=0.0,
+        path_mode=str(sim_config.get("path_mode", "boundary")),
     )
     return candidates, sample
 
@@ -1317,10 +1612,32 @@ def calibrate_local_params(
     return best_objective, best_nll, best_closed_loop_loss, best_tracking_loss, best_params
 
 
+def plot_site_polygon(ax, path: Path) -> None:
+    if path is None or not path.exists():
+        return
+    df = pd.read_csv(path)
+    if {"kind", "polygon_id", "x", "y", "vertex_index"}.issubset(df.columns):
+        for (kind, pid), g in df.groupby(["kind", "polygon_id"], sort=True):
+            xy = _closed_xy(g)
+            ax.plot(
+                xy[:, 0],
+                xy[:, 1],
+                lw=2.2 if str(kind) == "outer" else 1.8,
+                color="C0" if str(kind) == "outer" else "C3",
+                label=f"{kind} {pid}",
+            )
+        return
+    if {"part_index", "x", "y", "vertex_index"}.issubset(df.columns):
+        for i, (_, g) in enumerate(df.groupby("part_index", sort=True)):
+            xy = _closed_xy(g)
+            ax.plot(xy[:, 0], xy[:, 1], lw=2.0, color="C0", label="site curb" if i == 0 else None)
+
+
 def plot_all_trajectories(
     df: pd.DataFrame,
     out_path: Path,
     boundary_csv: Path | None = None,
+    site_polygon_csv: Path | None = None,
     max_points: int = 250_000,
 ) -> None:
     """XY overview of all trajectory points, colored by run/lane."""
@@ -1337,7 +1654,9 @@ def plot_all_trajectories(
             alpha=0.18,
             label=f"run {int(run_id)}, lane {int(lane_kf)}",
         )
-    if boundary_csv is not None and boundary_csv.exists():
+    if site_polygon_csv is not None:
+        plot_site_polygon(ax, site_polygon_csv)
+    elif boundary_csv is not None and boundary_csv.exists():
         bdf = pd.read_csv(boundary_csv)
         group_cols = ["run_id", "lane_kf"] if "lane_kf" in bdf.columns else ["run_id"]
         for key, group in bdf.groupby(group_cols, sort=True):
@@ -1429,9 +1748,12 @@ def simulate_vehicle(
             neighbor_radius=neighbor_radius,
             max_neighbors=max_neighbors,
         )
-        reference_pos = np.array([row["next_xloc_kf"], row["next_yloc_kf"]], dtype=float)
         agent.run_id = int(row["run_id"])
         agent.lane_kf = int(row["lane_kf"])
+        if local_config.get("utility_frame") == "destination":
+            reference_pos = np.asarray(agent.dest, dtype=float)
+        else:
+            reference_pos = np.array([row["next_xloc_kf"], row["next_yloc_kf"]], dtype=float)
         agent.utility_reference_pos = reference_pos
         chosen = select_best_candidate_with_boundary(
             agent,
@@ -1470,6 +1792,7 @@ def plot_vehicle_simulated_vs_observed(
     local_nll: float,
     out_path: Path,
     boundary_map: BoundaryMap,
+    site_polygon_csv: Path | None = None,
 ) -> None:
     """Per-ID observed vs simulated x-y, x(t), y(t), vx(t), vy(t), speed(t)."""
     group = group.sort_values("time")
@@ -1483,14 +1806,27 @@ def plot_vehicle_simulated_vs_observed(
     obs_points = group[["xloc_kf", "yloc_kf"]].to_numpy(float)
     sim_points = sim_df[["x", "y"]].to_numpy(float)
     obs_lower = obs_upper = sim_lower = sim_upper = None
-    if boundary is not None:
+    use_lane_tubes = site_polygon_csv is None and boundary is not None
+    if use_lane_tubes:
         obs_lower, obs_upper = closest_boundary_points(obs_points, boundary)
         sim_lower, sim_upper = closest_boundary_points(sim_points, boundary)
         axes[0, 0].plot(boundary["lower_x"], boundary["lower_y"], color="0.55", lw=2, label="boundary lower")
         axes[0, 0].plot(boundary["upper_x"], boundary["upper_y"], color="0.25", lw=2, label="boundary upper")
+    if site_polygon_csv is not None:
+        plot_site_polygon(axes[0, 0], site_polygon_csv)
 
     axes[0, 0].plot(group["xloc_kf"], group["yloc_kf"], lw=2, label="observed")
     axes[0, 0].plot(sim_df["x"], sim_df["y"], "--", lw=2, label="simulated")
+    dest = group[["final_x", "final_y"]].iloc[-1].to_numpy(float)
+    axes[0, 0].scatter(
+        dest[0],
+        dest[1],
+        s=80,
+        marker="*",
+        c="k",
+        zorder=6,
+        label="destination",
+    )
     axes[0, 0].set_xlabel("x (m)")
     axes[0, 0].set_ylabel("y (m)")
     axes[0, 0].set_aspect("equal", adjustable="box")
@@ -1556,6 +1892,45 @@ def plot_vehicle_simulated_vs_observed(
     plt.close(fig)
 
 
+def infer_site_polygon_csv(traj_csv: Path | None) -> Path | None:
+    """Jounieh/TGSIM use one shared curb polygon for every vehicle ID."""
+    if traj_csv is None:
+        return None
+    text = str(traj_csv).replace("\\", "/").lower()
+    if "lebanon_jounieh" in text:
+        path = REPO_ROOT / "data" / "Lebanon_Jounieh" / "Jounieh_Road_Boundaries.csv"
+        return path if path.exists() else None
+    if "tgsim" in text:
+        path = REPO_ROOT / "data" / "TGSIM FB" / "derived_boundaries" / "street_boundaries.csv"
+        return path if path.exists() else None
+    return None
+
+
+def apply_urban_site_config(cfg: EnvConfig, args: argparse.Namespace, ego_df: pd.DataFrame) -> None:
+    """Site curb + paper dest utility: U_dir and U_d use each ID's destination."""
+    if getattr(args, "site_polygon_csv", None) is None:
+        args.site_polygon_csv = infer_site_polygon_csv(getattr(args, "csv", None))
+    roadway = load_site_roadway(getattr(args, "site_polygon_csv", None))
+    if roadway is None:
+        cfg.sim_config["utility_frame"] = "corridor"
+        return
+    cfg.sim_config["_site_roadway"] = roadway
+    cfg.sim_config["_on_road_dest"] = OnRoadDestField(roadway)
+    cfg.sim_config["utility_frame"] = "destination"
+    cfg.sim_config["path_mode"] = "site_polygon"
+    cfg.sim_config["steer_from_rest"] = True
+    cfg.sim_config["min_steer_speed"] = 0.5
+    cfg.sim_config["candidate_accel_grid"] = [-5.0, -4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0]
+    cfg.sim_config["max_accel"] = 5.0
+    vmax = getattr(args, "max_agent_speed", None)
+    if vmax is None and len(ego_df):
+        vmax = max(4.0, float(np.quantile(ego_df["speed_kf"].to_numpy(float), 0.99)) * 1.15)
+    if vmax is not None:
+        cfg.sim_config["max_agent_speed"] = float(vmax)
+    # Do not use per-lane PCA lower/upper for these sites.
+    args.boundary_csv = None
+
+
 def plot_id_timeseries(
     df: pd.DataFrame,
     out_dir: Path,
@@ -1563,13 +1938,17 @@ def plot_id_timeseries(
     plot_all_ids: bool,
     global_params: dict[str, float],
     args: argparse.Namespace,
+    scene_df: pd.DataFrame | None = None,
 ) -> int:
     """Create per-ID observed-vs-simulated plots; bounded by default."""
     out_dir.mkdir(parents=True, exist_ok=True)
     cfg = EnvConfig()
-    cfg.sim_config["utility_frame"] = "corridor"
-    boundary_map = load_boundary_map(args.boundary_csv)
-    grouped_by_time = {key: group for key, group in df.groupby(["run_id", "time"], sort=False)}
+    apply_urban_site_config(cfg, args, df)
+    boundary_map = {}
+    if cfg.sim_config.get("_site_roadway") is None:
+        boundary_map = load_boundary_map(args.boundary_csv)
+    neighbor_src = scene_df if scene_df is not None else df
+    grouped_by_time = {key: group for key, group in neighbor_src.groupby(["run_id", "time"], sort=False)}
     groups = list(df.groupby(["run_id", "id"], sort=True))
     if not plot_all_ids:
         groups = groups[:max_ids]
@@ -1626,6 +2005,7 @@ def plot_id_timeseries(
             local_nll,
             out_dir / f"run_{int(run_id):02d}_id_{int(vehicle_id):06d}_sim_vs_obs.png",
             boundary_map=boundary_map,
+            site_polygon_csv=getattr(args, "site_polygon_csv", None),
         )
         row = {
             "run_id": int(run_id),
@@ -1822,12 +2202,18 @@ def write_diagnostics(
     samples: list[ChoiceSample],
     result: dict[str, Any],
     args: argparse.Namespace,
+    scene_df: pd.DataFrame | None = None,
 ) -> None:
     diag_dir = args.diagnostics_dir
     diag_dir.mkdir(parents=True, exist_ok=True)
     work_params = working_params_from_result(result)
     log_progress("Diagnostics: writing all-agents XY plot...", args.verbose)
-    plot_all_trajectories(df, diag_dir / "all_agents_xy.png", boundary_csv=args.boundary_csv)
+    plot_all_trajectories(
+        df,
+        diag_dir / "all_agents_xy.png",
+        boundary_csv=args.boundary_csv,
+        site_polygon_csv=getattr(args, "site_polygon_csv", None),
+    )
     n_id_plots = plot_id_timeseries(
         df,
         diag_dir / "per_id",
@@ -1835,6 +2221,7 @@ def write_diagnostics(
         plot_all_ids=args.plot_all_ids,
         global_params=work_params,
         args=args,
+        scene_df=scene_df,
     )
     log_progress("Diagnostics: writing calibration quality plots...", args.verbose)
     qdf = calibration_quality_frame(samples, work_params, args.temperature)
@@ -1971,7 +2358,19 @@ def main() -> None:
             / "derived_highway_boundaries"
             / "highway_boundaries.csv"
         ),
-        help="Optional highway boundary CSV to overlay on all_agents_xy.png",
+        help="Per-lane PCA corridor CSV (highway only). Cleared for Jounieh/TGSIM site-curb mode.",
+    )
+    parser.add_argument(
+        "--site-polygon-csv",
+        type=Path,
+        default=None,
+        help="Street curb for path cost. Jounieh/TGSIM also use each ID dest in U_dir/U_d.",
+    )
+    parser.add_argument(
+        "--max-agent-speed",
+        type=float,
+        default=None,
+        help="Cap on bicycle speed (m/s). Default 10 on highway; on sites, 1.15× p99 of ego speed.",
     )
     parser.add_argument("--no-plots", action="store_true", help="Skip calibration diagnostic plots")
     parser.add_argument(
@@ -2013,14 +2412,29 @@ def main() -> None:
     args = parser.parse_args()
 
     log_progress(f"Loading trajectory data from {args.csv}...", args.verbose)
-    df = load_and_prepare(args.csv, args.class_id)
-    log_progress(f"Loaded {len(df)} valid trajectory rows.", args.verbose)
+    df, scene_df = load_and_prepare(args.csv, args.class_id)
+    log_progress(
+        f"Loaded {len(df)} ego rows ({df['id'].nunique()} ids) and "
+        f"{len(scene_df)} neighbor-scene rows.",
+        args.verbose,
+    )
     cfg = EnvConfig()
-    cfg.sim_config["utility_frame"] = "corridor"
-    boundary_map = load_boundary_map(args.boundary_csv)
-    if not boundary_map:
-        print(f"Warning: no run/lane boundaries loaded from {args.boundary_csv}; using nominal-y fallback", flush=True)
-    samples = sample_choices(df, args, cfg.sim_config, boundary_map)
+    apply_urban_site_config(cfg, args, df)
+    if cfg.sim_config.get("utility_frame") == "destination":
+        log_progress(
+            "Site dest utility (on-road geodesic to each ID dest) + curb: "
+            f"{args.site_polygon_csv}, v_max={cfg.sim_config['max_agent_speed']:.2f} m/s.",
+            args.verbose,
+        )
+    boundary_map = {}
+    if cfg.sim_config.get("_site_roadway") is None:
+        boundary_map = load_boundary_map(args.boundary_csv)
+        if not boundary_map:
+            print(
+                f"Warning: no run/lane boundaries loaded from {args.boundary_csv}; using nominal-y fallback",
+                flush=True,
+            )
+    samples = sample_choices(df, args, cfg.sim_config, boundary_map, scene_df=scene_df)
     if not samples:
         raise RuntimeError("No calibration samples built from trajectory data")
     rollout_windows, val_windows, test_windows, split_info = split_rollout_windows(
@@ -2032,7 +2446,7 @@ def main() -> None:
         n_test=args.closed_loop_test_windows,
         group_fractions=tuple(args.window_split_fractions),
     )
-    grouped_by_time = {key: group for key, group in df.groupby(["run_id", "time"], sort=False)}
+    grouped_by_time = {key: group for key, group in scene_df.groupby(["run_id", "time"], sort=False)}
     log_progress(
         f"Prepared closed-loop windows (horizon={args.closed_loop_horizon_steps} steps): "
         f"{len(rollout_windows)} train / {len(val_windows)} val / {len(test_windows)} test "
@@ -2053,6 +2467,10 @@ def main() -> None:
         split_info=split_info,
     )
     log_progress("Global calibration finished.", args.verbose)
+    result["utility_frame"] = cfg.sim_config.get("utility_frame", "corridor")
+    result["max_agent_speed"] = cfg.sim_config.get("max_agent_speed")
+    if getattr(args, "site_polygon_csv", None):
+        result["site_polygon_csv"] = str(args.site_polygon_csv)
     result["boundary_summary_pca"] = boundary_summary(df)
     result["candidate_grid"] = {
         "acceleration": cfg.sim_config["candidate_accel_grid"],
@@ -2078,7 +2496,7 @@ def main() -> None:
         if not near_df.empty:
             near_df.to_csv(trials_dir / "near_optimal_trials.csv", index=False)
     if not args.no_plots:
-        write_diagnostics(df, samples, result, args)
+        write_diagnostics(df, samples, result, args, scene_df=scene_df)
     print(f"Wrote {args.output}", flush=True)
     print("Best objective:", f"{result['best_objective']:.4f}", flush=True)
     print("Robust objective:", f"{result['robust_objective']:.4f}", flush=True)

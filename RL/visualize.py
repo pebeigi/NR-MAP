@@ -81,6 +81,7 @@ def load_policy(checkpoint: Path) -> Any | None:
         payload["obs_dim"],
         hidden_dim=payload["hidden_dim"],
         residual_scales=payload.get("residual_scales"),
+        highway_length=float(payload.get("highway_length", 500.0)),
     )
     policy.load_state_dict(payload["state_dict"], strict=False)
     policy.eval()

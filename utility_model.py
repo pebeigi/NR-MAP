@@ -466,23 +466,39 @@ def candidate_obb_conflict(
     cand_pos = np.asarray(candidate["pos"], dtype=float)
     cand_heading = float(candidate.get("heading", 0.0))
     dt = float(candidate.get("time_to_reach", sim_config.get("dt", 0.5)))
+    if context is None:
+        context = build_step_context(agent_idx, agents[agent_idx], agents, sim_config)
 
-    if (
-        context is not None
-        and context.neighbor_corners is not None
-        and context.neighbor_mu is not None
-        and abs(context.dt - dt) < 1e-12
-    ):
-        return boxes_overlap_any(
-            cand_pos, cand_heading, context.neighbor_corners, context.neighbor_mu, length, width
-        )
+    samples = list(context.conflict_samples)
+    if not samples:
+        if (
+            context.neighbor_corners is not None
+            and context.neighbor_mu is not None
+            and abs(context.dt - dt) < 1e-12
+        ):
+            return boxes_overlap_any(
+                cand_pos, cand_heading, context.neighbor_corners, context.neighbor_mu, length, width
+            )
+        return False
 
-    for j, other in enumerate(agents):
-        if j == agent_idx:
-            continue
-        mu = np.asarray(other.pos, dtype=float) + np.asarray(other.vel, dtype=float) * dt
-        other_heading = float(other.heading_angle if other.heading_angle is not None else 0.0)
-        if boxes_overlap(cand_pos, cand_heading, mu, other_heading, length, width):
+    ego = agents[agent_idx]
+    start = np.asarray(ego.pos, dtype=float)
+    start_h = float(ego.heading_angle if ego.heading_angle is not None else 0.0)
+    cand_vel = np.asarray(candidate.get("vel", [0.0, 0.0]), dtype=float)
+
+    def _wrap(a: float) -> float:
+        return float((a + np.pi) % (2.0 * np.pi) - np.pi)
+
+    for t, mu_t, corners_t in samples:
+        t = float(t)
+        if t <= dt:
+            alpha = t / max(dt, 1e-9)
+            pos = (1.0 - alpha) * start + alpha * cand_pos
+            heading = start_h + alpha * _wrap(cand_heading - start_h)
+        else:
+            pos = cand_pos + cand_vel * (t - dt)
+            heading = cand_heading
+        if boxes_overlap_any(pos, heading, corners_t, mu_t, length, width):
             return True
     return False
 
@@ -631,7 +647,10 @@ def kinematic_bicycle_rollout(
     accel_clipped = float(np.clip(accel, -max_accel, max_accel))
 
     v_next = float(np.clip(speed + accel_clipped * dt, 0.0, max_speed))
-    yaw_rate = (speed / max(wheelbase, 1e-6)) * np.tan(steering)
+    yaw_speed = speed
+    if sim_config.get("steer_from_rest"):
+        yaw_speed = max(speed, v_next, float(sim_config.get("min_steer_speed", 0.5)))
+    yaw_rate = (yaw_speed / max(wheelbase, 1e-6)) * np.tan(steering)
     psi_next = float(heading + yaw_rate * dt)
     x_next = float(pos[0] + v_next * np.cos(psi_next) * dt)
     y_next = float(pos[1] + v_next * np.sin(psi_next) * dt)
@@ -715,6 +734,8 @@ class AgentStepContext:
     dt: float = 0.0
     neighbor_mu: np.ndarray | None = None
     neighbor_corners: np.ndarray | None = None
+    # Optional extra (t, mu, corners) samples for closed-loop conflict lookahead.
+    conflict_samples: tuple = ()
 
 
 def build_step_context(
@@ -746,7 +767,7 @@ def build_step_context(
 
     dt = float(sim_config.get("dt", 0.5))
     length, width = _vehicle_footprint(sim_config)
-    others = [a for j, a in enumerate(agents) if j != agent_idx]
+    others = [a for j, a in enumerate(agents) if j != agent_idx and not a.reached_destination]
     if others:
         mu = np.array(
             [np.asarray(o.pos, dtype=float) + np.asarray(o.vel, dtype=float) * dt for o in others],
@@ -759,7 +780,19 @@ def build_step_context(
         corners = oriented_box_corners_batch(mu, headings, length, width)
     else:
         mu = np.zeros((0, 2), dtype=float)
+        headings = np.zeros((0,), dtype=float)
         corners = np.zeros((0, 4, 2), dtype=float)
+
+    n_sub = max(1, int(sim_config.get("conflict_substeps", 1)))
+    horizon = float(sim_config.get("conflict_horizon", dt))
+    samples: list[tuple[float, np.ndarray, np.ndarray]] = []
+    if others and (n_sub > 1 or abs(horizon - dt) > 1e-12):
+        pos0 = np.array([np.asarray(o.pos, dtype=float) for o in others], dtype=float)
+        vel0 = np.array([np.asarray(o.vel, dtype=float) for o in others], dtype=float)
+        for k in range(1, n_sub + 1):
+            t = horizon * float(k) / float(n_sub)
+            mu_t = pos0 + vel0 * t
+            samples.append((t, mu_t, oriented_box_corners_batch(mu_t, headings, length, width)))
 
     return AgentStepContext(
         corridor_geom=corridor_geom,
@@ -770,6 +803,7 @@ def build_step_context(
         dt=dt,
         neighbor_mu=mu,
         neighbor_corners=corners,
+        conflict_samples=tuple(samples),
     )
 
 

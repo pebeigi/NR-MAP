@@ -34,7 +34,7 @@ DEFAULT_RESIDUAL_SCALES: dict[str, float] = {
     "S_v": 1.5,
     "S_theta": 1.5,
     "S_d": 2.0,
-    "w_c": 80.0,
+    "w_c": 250.0,
     "xi_i": 1.0,
     "gamma": 1.0,
     "w_ell": 15.0,

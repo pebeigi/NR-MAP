@@ -35,6 +35,7 @@ def load_residual_policy(checkpoint: Path, obs_dim: int) -> Any:
         obs_dim=int(blob.get("obs_dim", obs_dim)),
         hidden_dim=int(blob.get("hidden_dim", 128)),
         residual_scales=blob.get("residual_scales"),
+        highway_length=float(blob.get("highway_length", 500.0)),
     )
     policy.load_state_dict(blob["state_dict"])
     policy.eval()

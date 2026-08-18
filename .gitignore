@@ -61,6 +61,16 @@ figures/sensitivity/3d/
 
 # Calibration run artifacts (regenerated locally; keep utility_calibration.json)
 calibration/diagnostics/
+Calibration/diagnostics/
+Calibration/diagnostics_*/
+calibration/diagnostics_*/
+Calibration/utility_calibration_pre_split_backup.json
+
+# Closed-loop benchmark dumps (paper tables live in Paper Draft/)
+Baselines/results/
+
+# Training logs
+RL/logs/
 
 # Ray / RLlib local caches
 ray_results/

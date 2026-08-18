@@ -24,6 +24,14 @@ import Sensitivity._paths  # noqa: F401
 from Sensitivity._paths import REPO_ROOT
 
 OUTPUT_DIR = REPO_ROOT / "figures" / "sensitivity" / "3d"
+APPENDIX_DIR = REPO_ROOT / "Paper Draft" / "Appendix"
+
+# Robust highway working point used in the main experiments (theta_rob).
+COLLISION_W_C = 300.0
+VEHICLE_LENGTH_M = 4.5
+VEHICLE_WIDTH_M = 1.8
+SIGMA_PARALLEL_M = 0.89
+SIGMA_PERP_ROB_M = 0.59
 
 
 def directional_utility(s_theta: np.ndarray, alignment_cos: np.ndarray) -> np.ndarray:
@@ -51,11 +59,26 @@ def proximity_utility(
     return s_d / (1 + (d_eff / h_p) ** gamma)
 
 
-def collision_utility(w_c: np.ndarray, d: np.ndarray, sigma: np.ndarray) -> np.ndarray:
-    """Collision penalty contribution for a single isotropic 2D neighbor prediction."""
-    sigma = np.maximum(sigma, 1e-6)
-    prob_coll = (1.0 / (2 * np.pi * sigma**2)) * np.exp(-0.5 * (d / sigma) ** 2)
-    return -w_c * prob_coll
+def collision_utility(
+    w_c: np.ndarray,
+    dx: np.ndarray,
+    dy: np.ndarray,
+    sigma_parallel: np.ndarray,
+    sigma_perp: np.ndarray,
+    length: float = VEHICLE_LENGTH_M,
+    width: float = VEHICLE_WIDTH_M,
+) -> np.ndarray:
+    """Single-neighbor OBB surface-gap penalty used by utility_model.collision_penalty.
+
+    Presence is 1 on overlapping L×W footprints and decays as an anisotropic
+    Gaussian of the surface gaps (not a centre-to-centre PDF).
+    """
+    gap_parallel = np.maximum(0.0, np.abs(dx) - length)
+    gap_perp = np.maximum(0.0, np.abs(dy) - width)
+    sig_par = np.maximum(sigma_parallel, 1e-6)
+    sig_lat = np.maximum(sigma_perp, 1e-6)
+    presence = np.exp(-0.5 * ((gap_parallel / sig_par) ** 2 + (gap_perp / sig_lat) ** 2))
+    return -w_c * presence
 
 
 def path_adherence_utility(
@@ -199,21 +222,34 @@ def plot_proximity_3d(show: bool = False) -> None:
 
 
 def plot_collision_3d(show: bool = False) -> None:
-    # Avoid very small sigma values; they create a near-singular spike at d=0.
-    w_c = np.linspace(0.1, 20.0, 80)
-    d = np.linspace(0.0, 12.0, 80)
-    sigma_slices = [1.0, 3.5, 6.0]
+    dx = np.linspace(0.0, 12.0, 80)
+    dy = np.linspace(0.0, 6.0, 80)
+    # Hold theta_rob (w_c, sigma_parallel, L×W); slice the lateral kernel width.
+    sigma_perp_slices = [0.30, SIGMA_PERP_ROB_M, 1.20]
+    output_path = OUTPUT_DIR / "collision_utility_surface_slices.png"
     plot_response_surface_slices(
-        w_c,
-        d,
-        sigma_slices,
-        utility_fn=lambda w_grid, d_grid, sigma: collision_utility(w_grid, d_grid, sigma),
-        labels=(r"$w_c$", r"$\|\vec r_g-\vec \mu_j\|$", r"$\sigma$"),
-        title="Collision Utility Response Surfaces",
-        output_path=OUTPUT_DIR / "collision_utility_surface_slices.png",
+        dx,
+        dy,
+        sigma_perp_slices,
+        utility_fn=lambda dx_grid, dy_grid, sigma_perp: collision_utility(
+            COLLISION_W_C,
+            dx_grid,
+            dy_grid,
+            SIGMA_PARALLEL_M,
+            sigma_perp,
+        ),
+        labels=(r"$|\Delta x|$ (m)", r"$|\Delta y|$ (m)", r"$\sigma_{\perp}$"),
+        title=(
+            r"Collision Utility Response Surfaces "
+            r"(OBB surface-gap kernel at $\theta_{\mathrm{rob}}$)"
+        ),
+        output_path=output_path,
         cmap="magma",
         show=show,
     )
+    appendix_path = APPENDIX_DIR / "collision_utility_surface_slices.png"
+    appendix_path.parent.mkdir(parents=True, exist_ok=True)
+    appendix_path.write_bytes(output_path.read_bytes())
 
 
 def plot_path_3d(show: bool = False) -> None:

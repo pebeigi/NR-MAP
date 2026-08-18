@@ -33,19 +33,20 @@ except ImportError as exc:
 
 
 def normalize_obs(obs: torch.Tensor, highway_length: float = 500.0) -> torch.Tensor:
-    """Scale observation features to a PPO-friendly numeric range."""
+    """Scale Frenet / body-frame features into a PPO-friendly range."""
     obs = obs.clone()
-    obs[..., 0] = obs[..., 0] / highway_length
-    obs[..., 1] = obs[..., 1] / 12.0
+    length = max(float(highway_length), 1.0)
+    obs[..., 0] = obs[..., 0] / length
+    obs[..., 1] = obs[..., 1] / 8.0
     obs[..., 2] = obs[..., 2] / 16.0
     obs[..., 3] = obs[..., 3] / np.pi
     obs[..., 4] = obs[..., 4] / np.pi
-    obs[..., 5] = obs[..., 5] / 24.0
-    obs[..., 6] = obs[..., 6] / 24.0
+    obs[..., 5] = obs[..., 5] / 12.0
+    obs[..., 6] = obs[..., 6] / 12.0
 
     for start in range(7, obs.shape[-1], 4):
         obs[..., start] = obs[..., start] / 60.0
-        obs[..., start + 1] = obs[..., start + 1] / 24.0
+        obs[..., start + 1] = obs[..., start + 1] / 12.0
         obs[..., start + 2] = obs[..., start + 2] / 16.0
         obs[..., start + 3] = obs[..., start + 3] / 16.0
     return obs
@@ -59,6 +60,7 @@ class TorchResidualPolicy(nn.Module):
         obs_dim: int,
         hidden_dim: int = 128,
         residual_scales: dict[str, float] | None = None,
+        highway_length: float = 500.0,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -66,6 +68,7 @@ class TorchResidualPolicy(nn.Module):
         scales = residual_scales or DEFAULT_RESIDUAL_SCALES
         scale_vec = torch.tensor([float(scales[k]) for k in RESIDUAL_PARAM_KEYS], dtype=torch.float32)
         self.register_buffer("residual_scales", scale_vec)
+        self.register_buffer("highway_length", torch.tensor(float(highway_length)))
         # Kept for older checkpoint / visualize_simulation compatibility.
         self.residual_scale = float(scale_vec.mean().item())
 
@@ -87,7 +90,7 @@ class TorchResidualPolicy(nn.Module):
         self.log_std = nn.Parameter(torch.full((len(RESIDUAL_PARAM_KEYS),), -1.2))
 
     def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        obs_n = normalize_obs(obs)
+        obs_n = normalize_obs(obs, float(self.highway_length.item()))
         mean = self.actor(obs_n) * self.residual_scales
         value = self.critic(obs_n).squeeze(-1)
         return mean, value
@@ -292,6 +295,7 @@ def train(args: argparse.Namespace) -> None:
         probe_env.obs_dim,
         hidden_dim=args.hidden_dim,
         residual_scales=DEFAULT_RESIDUAL_SCALES,
+        highway_length=float(probe_env.config.highway_length),
     )
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
 
@@ -308,6 +312,8 @@ def train(args: argparse.Namespace) -> None:
     print(f"Utility-only baseline metric over {args.baseline_episodes} episodes: {base:.3f}")
 
     best_metric = float("inf")
+    best_collisions = float("inf")
+    best_state = None
     for update in range(1, args.updates + 1):
         env = make_env(args, seed=args.seed + update * 1000)
         memory, metrics, collisions, realism = collect_rollouts(
@@ -327,6 +333,12 @@ def train(args: argparse.Namespace) -> None:
         )
 
         mean_metric = float(np.mean(metrics))
+        mean_collisions = float(np.mean(collisions))
+        if mean_collisions < best_collisions - 1e-9 or (
+            abs(mean_collisions - best_collisions) < 1e-9 and mean_metric < best_metric
+        ):
+            best_collisions = mean_collisions
+            best_state = {k: v.detach().cpu().clone() for k, v in policy.state_dict().items()}
         best_metric = min(best_metric, mean_metric)
         log_every = args.log_every if args.log_every > 0 else max(min(args.updates // 10, 10), 1)
         if update == 1 or update % log_every == 0:
@@ -341,24 +353,29 @@ def train(args: argparse.Namespace) -> None:
 
     if args.save is not None:
         args.save.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "state_dict": policy.state_dict(),
-                "obs_dim": probe_env.obs_dim,
-                "hidden_dim": args.hidden_dim,
-                "residual_scale": policy.residual_scale,
-                "residual_scales": {k: float(DEFAULT_RESIDUAL_SCALES[k]) for k in RESIDUAL_PARAM_KEYS},
-                "algo": "ppo",
-                "prefer_params": args.prefer_params,
-                "calibration": str(args.calibration) if args.calibration else None,
-                "collision_penalty": float(args.collision_penalty),
-                "behavior_coef": float(args.behavior_coef),
-                "behavior_shaping_coef": float(args.behavior_shaping_coef),
-                "updates": int(args.updates),
-            },
-            args.save,
+        if best_state is not None:
+            policy.load_state_dict(best_state)
+        blob = {
+            "state_dict": policy.state_dict(),
+            "obs_dim": probe_env.obs_dim,
+            "hidden_dim": args.hidden_dim,
+            "residual_scale": policy.residual_scale,
+            "residual_scales": {k: float(DEFAULT_RESIDUAL_SCALES[k]) for k in RESIDUAL_PARAM_KEYS},
+            "highway_length": float(probe_env.config.highway_length),
+            "algo": "ppo",
+            "prefer_params": args.prefer_params,
+            "calibration": str(args.calibration) if args.calibration else None,
+            "collision_penalty": float(args.collision_penalty),
+            "behavior_coef": float(args.behavior_coef),
+            "behavior_shaping_coef": float(args.behavior_shaping_coef),
+            "updates": int(args.updates),
+            "best_collisions": float(best_collisions),
+        }
+        torch.save(blob, args.save)
+        print(
+            f"Saved PPO residual policy to {args.save} "
+            f"(best train collisions={best_collisions:.2f})"
         )
-        print(f"Saved PPO residual policy to {args.save}")
 
 
 def main() -> None:
@@ -398,7 +415,7 @@ def main() -> None:
     parser.add_argument(
         "--collision-penalty",
         type=float,
-        default=0.0,
+        default=8.0,
         help="Per-step reward penalty for each agent involved in an OBB collision",
     )
     parser.add_argument(

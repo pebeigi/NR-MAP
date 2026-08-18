@@ -12,12 +12,19 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
+_REPO = _SCRIPT_DIR.parent.parent  # data/<site>/script.py → repo
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+from data.filter_calibration_vehicles import vehicle_keep_mask
+
 DEFAULT_CSV = (
     _SCRIPT_DIR / "Third_Generation_Simulation_Data__TGSIM__Foggy_Bottom_Trajectories.csv"
 )
@@ -63,10 +70,19 @@ def main() -> None:
     print(f"Loading {args.csv}...")
     raw = pd.read_csv(args.csv)
     traj = normalize(raw)
+    n_before = traj.groupby(["run_id", "id"]).ngroups
+    traj, report = vehicle_keep_mask(traj)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     traj_path = args.out_dir / "trajectories_calibration.csv"
+    report_path = args.out_dir / "vehicle_filter_report.csv"
     traj.to_csv(traj_path, index=False)
-    print(f"Wrote {traj_path} ({len(traj):,} rows, {traj['id'].nunique()} ids)")
+    report.to_csv(report_path, index=False)
+    print(
+        f"Wrote {traj_path} ({len(traj):,} rows, {traj['id'].nunique()} ids; "
+        f"dropped {n_before - int(report['keep'].sum())} vehicles "
+        f"as short/stationary)"
+    )
+    print(f"Wrote {report_path}")
 
     type_note = (
         traj.groupby("class")
